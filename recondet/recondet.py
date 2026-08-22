@@ -87,7 +87,8 @@ class ReconDet(Base3DDetector):
             lambda_dist=1.0,
             if_task_query=False,
             if_add_noises=False,
-            noise_level=None
+            noise_level=None,
+            vggt_weight_path = None,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -96,7 +97,7 @@ class ReconDet(Base3DDetector):
         bbox_head.update(test_cfg=test_cfg)
         self.bbox_head = MODELS.build(bbox_head)
 
-        self.vggt_encoder = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+        self.vggt_encoder = VGGT.from_pretrained(vggt_weight_path).to(device)
 
         for param in self.vggt_encoder.parameters():
             param.requires_grad = False
