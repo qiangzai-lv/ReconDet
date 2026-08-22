@@ -1,0 +1,414 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+from functools import partial
+from typing import List, Tuple
+
+import torch
+import torch.nn.functional as F
+from mmcv.cnn import Scale
+from mmdet.models.utils import multi_apply
+from mmengine.model import BaseModule
+from mmengine.structures import InstanceData
+from torch import Tensor, nn
+
+from detr3_models.helpers import GenericMLP
+from mmdet3d.registry import MODELS, TASK_UTILS
+from mmdet3d.structures.det3d_data_sample import SampleList
+from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
+from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
+                                        OptConfigType, OptInstanceList)
+from recondet.matcher import UnifiedMatcher, UnifiedMatcherMoreThanOne
+
+
+@torch.no_grad()
+def get_points(n_voxels, voxel_size, origin):
+    # origin: point-cloud center.
+    points = torch.stack(
+        torch.meshgrid([
+            torch.arange(n_voxels[0]),  # 40 W width, x
+            torch.arange(n_voxels[1]),  # 40 D depth, y
+            torch.arange(n_voxels[2])  # 16 H Height, z
+        ]))
+    new_origin = origin - n_voxels / 2. * voxel_size
+    points = points * voxel_size.view(3, 1, 1, 1) + new_origin.view(3, 1, 1, 1)
+    return points
+
+
+@MODELS.register_module()
+class ReconDetHead(BaseModule):
+
+    def __init__(self,
+                 n_classes: int,
+                 n_levels: int,
+                 n_channels: int,
+                 n_reg_outs: int,
+                 pts_assign_threshold: int,
+                 pts_center_threshold: int,
+                 prior_generator: ConfigType,
+                 objness_loss: ConfigType = dict(type='mmdet.FocalLoss', use_sigmoid=True),
+                 train_cfg: OptConfigType = None,
+                 test_cfg: OptConfigType = None,
+                 init_cfg: OptConfigType = None,
+                 mlp_dropout=0.3,
+                 matcher_cost_weights={'cls': 1.0, 'center': 0.0, 'obj_ness': 0.0, 'giou': 2.0},
+                 loss_weights={'center_loss': 5.0, 'size_loss': 1.0,
+                               'cls_loss': 1.0,
+                               'objness_loss': 1.0,
+                               'iou_loss': 1.0,
+                               'not_objness_loss': 0.25},
+                 learn_center_diff=False,
+                 if_v2_head=False,
+                 if_project_frist_frame_back=False,
+                 matcher='one2one',
+                 matcher_iou_thres=0.25,
+                 matcher_max_dynamic_samples=10
+                 ):
+        super(ReconDetHead, self).__init__(init_cfg)
+        self.n_classes = n_classes
+        self.n_levels = n_levels
+        self.n_reg_outs = n_reg_outs
+        self.pts_assign_threshold = pts_assign_threshold
+        self.pts_center_threshold = pts_center_threshold
+        self.prior_generator = TASK_UTILS.build(prior_generator)
+        class_weights = torch.ones((self.n_classes + 1), device='cuda') * 1.0
+        class_weights[-1] = loss_weights['not_objness_loss']
+        self.cls_loss = nn.CrossEntropyLoss(weight=class_weights)  # MODELS.build(cls_loss)
+        self.objness_loss = MODELS.build(objness_loss)
+        self.train_cfg = train_cfg
+        self.test_cfg = test_cfg
+        if if_v2_head:
+            self.mlp_func = partial(
+                GenericMLP,
+                norm_fn_name="bn1d",
+                activation="relu",
+                use_conv=True,
+                hidden_dims=[n_channels, n_channels // 2, n_channels // 4, n_channels // 8],
+                dropout=mlp_dropout,
+                input_dim=n_channels,
+            )
+        else:
+            self.mlp_func = partial(
+                GenericMLP,
+                norm_fn_name="bn1d",
+                activation="relu",
+                use_conv=True,
+                hidden_dims=[n_channels, n_channels],
+                dropout=mlp_dropout,
+                input_dim=n_channels,
+            )
+        self._init_layers(n_channels, n_reg_outs, n_classes, n_levels)
+        assert matcher in ['one2one', 'one2more']
+        if matcher == 'one2one':
+            self.matcher = UnifiedMatcher(cost_weights=matcher_cost_weights)
+        elif matcher == 'one2more':
+            self.matcher = UnifiedMatcherMoreThanOne(cost_weights=matcher_cost_weights,
+                                                     matcher_iou_thres=matcher_iou_thres,
+                                                     matcher_max_dynamic_samples=matcher_max_dynamic_samples)
+        self.loss_weights = loss_weights
+        self.learn_center_diff = learn_center_diff
+        self.if_project_frist_frame_back = if_project_frist_frame_back
+
+    def _init_layers(self, n_channels, n_reg_outs, n_classes, n_levels):
+        self.center_head = self.mlp_func(output_dim=3)
+        self.size_head = self.mlp_func(output_dim=3)
+        self.semcls_head = self.mlp_func(output_dim=n_classes + 1)  # foreground categories
+        self.scales = nn.ModuleList([Scale(1.) for _ in range(n_levels)])
+
+    def project_the_first_frame_back(self, x: Tensor, pose_matrix, axis_align_matrix):
+        batch_size, _, num_boxes = x.shape
+        pose_matrix = torch.stack(pose_matrix, dim=0).to(x.device, dtype=x.dtype)  # [16, 4, 4]
+        axis_align_matrix = torch.stack(axis_align_matrix, dim=0).to(x.device, dtype=x.dtype)
+        ones = torch.ones(batch_size, 1, num_boxes, device=x.device)  # [16, 1, 256]
+        x_homogeneous = torch.cat([x, ones], dim=1)  # [16, 4, 256]
+
+        x_global_homogeneous = torch.bmm(pose_matrix, x_homogeneous)  # [16, 4, 256]
+        x_global_homogeneous = torch.bmm(axis_align_matrix, x_global_homogeneous)
+        w = torch.clamp(x_global_homogeneous[:, 3:4, :], min=1e-8)
+        x_global = x_global_homogeneous[:, :3, :] / w
+        return x_global
+
+    def _forward_single(self, x: Tensor, scale: Scale, query_xyz, pose_matrix, axis_align_matrix, avg_distance):
+
+        if self.learn_center_diff:
+            query_xyz = query_xyz.permute(0, 2, 1)
+            if self.if_project_frist_frame_back:
+                center_pred = self.project_the_first_frame_back(self.center_head(x) + query_xyz, pose_matrix,
+                                                                axis_align_matrix)
+            else:
+                center_pred = self.center_head(x) + query_xyz
+
+        else:
+            if self.if_project_frist_frame_back:
+                center_pred = self.project_the_first_frame_back(self.center_head(x), pose_matrix, axis_align_matrix)
+            else:
+                center_pred = self.center_head(x)
+
+        return (center_pred, torch.exp(scale(self.size_head(x))),  # / avg_distance_tensor,
+                self.semcls_head(x))  # , self.objness_head(x)
+
+    def forward(self, x, batch_inputs_dict, batch_data_samples):
+        if 'query_xyz' in batch_inputs_dict.keys():
+            return multi_apply(self._forward_single, x, self.scales,
+                               [batch_inputs_dict['query_xyz'] for _ in range(self.n_levels)],
+                               [batch_inputs_dict['pose_matrix'] for _ in range(self.n_levels)],
+                               [batch_inputs_dict['axis_align_matrix'] for _ in range(self.n_levels)],
+                               [batch_inputs_dict['avg_distance'] for _ in range(self.n_levels)])
+        else:
+            return multi_apply(self._forward_single, x, self.scales, [None for _ in range(self.n_levels)],
+                               [batch_inputs_dict['pose_matrix'] for _ in range(self.n_levels)],
+                               [batch_inputs_dict['axis_align_matrix'] for _ in range(self.n_levels)],
+                               [batch_inputs_dict['avg_distance'] for _ in range(self.n_levels)])
+
+    def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList, batch_inputs_dict: dict,
+             **kwargs) -> dict:
+
+        outs = self(x, batch_inputs_dict,
+                    batch_data_samples)  # x len: 8, every tensor shape: [bs, feat_dim, num_queries]
+
+        if 'points' in batch_inputs_dict.keys():
+            batch_input_points = batch_inputs_dict['points']
+        else:
+            batch_input_points = [None for i in range(len(batch_data_samples))]
+
+        batch_gt_instances_3d = []
+        batch_gt_instances_ignore = []
+        batch_input_metas = []
+        for data_sample in batch_data_samples:
+            batch_input_metas.append(data_sample.metainfo)
+            batch_gt_instances_3d.append(data_sample.gt_instances_3d)
+            batch_gt_instances_ignore.append(
+                data_sample.get('ignored_instances', None))
+
+        loss_inputs = outs + (batch_gt_instances_3d,
+                              batch_input_metas, batch_input_points, batch_gt_instances_ignore)
+        losses = self.loss_by_feat(*loss_inputs)
+        return losses
+
+    def loss_by_feat(self,
+                     center_preds: List[List[Tensor]],
+                     size_preds: List[List[Tensor]],
+                     cls_preds: List[List[Tensor]],
+                     #  objness_preds: List[List[Tensor]],
+                     batch_gt_instances_3d: InstanceList,
+                     batch_input_metas: List[dict],
+                     batch_input_points,
+                     batch_gt_instances_ignore: OptInstanceList = None,
+                     **kwargs) -> dict:
+
+        center_losses, size_losses, cls_losses, objness_losses, giou_losses = [], [], [], [], []
+        for i in range(len(batch_input_metas)):
+            center_loss, size_loss, cls_loss, giou_loss = self._loss_by_feat_single(
+                center_preds=[x[i] for x in center_preds],
+                size_preds=[x[i] for x in size_preds],
+                cls_preds=[x[i] for x in cls_preds],
+                input_meta=batch_input_metas[i],
+                gt_bboxes=batch_gt_instances_3d[i].bboxes_3d,
+                gt_labels=batch_gt_instances_3d[i].labels_3d,
+                input_points=batch_input_points[i])
+            center_losses.append(center_loss)
+            size_losses.append(size_loss)
+            cls_losses.append(cls_loss)
+            giou_losses.append(giou_loss)
+
+        return dict(
+            center_loss=torch.mean(torch.stack(center_losses)),
+            size_loss=torch.mean(torch.stack(size_losses)),
+            cls_loss=torch.mean(torch.stack(cls_losses)),
+            giou_loss=torch.mean(torch.stack(giou_losses))
+        )
+
+    def _loss_by_feat_single(self, center_preds, size_preds, cls_preds,  # objness_preds,
+                             input_meta, gt_bboxes, gt_labels, input_points):
+
+        all_centers = torch.cat([c.t() for c in center_preds], dim=0)  # (Total_Pred, 3)
+        all_sizes = torch.cat([s.t() for s in size_preds], dim=0)  # (Total_Pred, 3)
+        all_cls = torch.cat([c.t() for c in cls_preds], dim=0)  # (Total_Pred, C)
+
+        gt_centers = gt_bboxes.gravity_center
+        gt_sizes = gt_bboxes.tensor[:, 3:6]
+
+        all_pred_indices = []
+        all_gt_indices = []
+        offset = 0
+
+        for stage_idx in range(len(center_preds)):
+            centers, sizes, cls_scores = center_preds[stage_idx].t(), size_preds[stage_idx].t(), cls_preds[
+                stage_idx].t()  # , objness_preds[stage_idx].t()
+            cls_scores_softmax = F.softmax(cls_scores, dim=1)
+            obj_scores = 1.0 - cls_scores_softmax[:, -1]
+            n_predictions = centers.size(0)
+
+            pred_indices, gt_indices = self.matcher._get_targets(
+                centers, sizes, cls_scores, obj_scores,
+                gt_centers, gt_sizes, gt_labels
+            )
+
+            all_pred_indices.append(pred_indices + offset)
+            all_gt_indices.append(gt_indices)
+
+            offset += n_predictions
+
+        pred_indices, gt_indices = torch.cat(all_pred_indices), torch.cat(all_gt_indices)
+        matched_centers = all_centers[pred_indices]
+        matched_sizes = all_sizes[pred_indices]
+        matched_gt_centers = gt_centers[gt_indices]
+        matched_gt_sizes = gt_sizes[gt_indices]
+        matched_gt_labels = gt_labels[gt_indices]
+        center_loss = F.l1_loss(matched_centers, matched_gt_centers) * self.loss_weights['center_loss']
+        size_loss = F.l1_loss(matched_sizes, matched_gt_sizes) * self.loss_weights['size_loss']
+        cls_target = torch.ones((all_centers.shape[0]), device=all_centers.device) * self.n_classes
+        cls_target = cls_target.long()
+        cls_target[pred_indices] = matched_gt_labels
+        cls_loss = self.cls_loss(all_cls, cls_target) * self.loss_weights['cls_loss']
+        pred_tp_bbox = self._center_size_pred_to_bbox(matched_centers, matched_sizes)
+        gt_tp_bbox = self._center_size_pred_to_bbox(matched_gt_centers, matched_gt_sizes)
+        giou = axis_aligned_bbox_overlaps_3d(pred_tp_bbox.unsqueeze(0), gt_tp_bbox.unsqueeze(0), mode='giou',
+                                             is_aligned=True)
+        giou_loss = (1.0 - giou).mean() * self.loss_weights['iou_loss']
+        return center_loss, size_loss, cls_loss, giou_loss
+
+    def predict(self,
+                x: Tuple[Tensor],
+                batch_data_samples: SampleList, batch_inputs_dict,
+                rescale: bool = False) -> InstanceList:
+
+        batch_input_metas = [
+            data_samples.metainfo for data_samples in batch_data_samples
+        ]
+        outs = self(x, batch_inputs_dict, batch_data_samples)
+        predictions = self.predict_by_feat(
+            *outs,
+            batch_input_metas=batch_input_metas,
+            rescale=rescale, batch_inputs_dict=batch_inputs_dict, batch_data_samples=batch_data_samples)
+        return predictions
+
+    def predict_by_feat(self, center_preds: List[List[Tensor]],
+                        size_preds: List[List[Tensor]],
+                        cls_preds: List[List[Tensor]],
+                        batch_input_metas: List[dict], batch_inputs_dict: dict, batch_data_samples,
+                        **kwargs) -> List[InstanceData]:
+
+        results = []
+        if 'points' in batch_inputs_dict.keys():
+            batch_input_points = batch_inputs_dict['points']
+        else:
+            batch_input_points = [None for i in range(len(batch_input_metas))]
+        for i in range(len(batch_input_metas)):
+            results.append(
+                self._predict_by_feat_single(
+                    center_preds=[x[i] for x in center_preds],
+                    size_preds=[x[i] for x in size_preds],
+                    cls_preds=[x[i] for x in cls_preds],
+                    input_meta=batch_input_metas[i],
+                    input_points=batch_input_points[i],
+                    data_samples=batch_data_samples[i]))
+        return results
+
+    def _predict_by_feat_single(self, center_preds, size_preds, cls_preds,
+                                input_meta: dict, input_points, data_samples) -> InstanceData:
+
+        mlvl_bboxes, mlvl_scores = [], []
+        for stage_idx in range(len(center_preds)):
+            centers, sizes, cls_scores = center_preds[stage_idx].t(), size_preds[stage_idx].t(), cls_preds[
+                stage_idx].t()
+            cls_scores = F.softmax(cls_scores, dim=1)
+            objectness = 1 - cls_scores[:, -1]
+            scores = cls_scores[:, :-1] * objectness.unsqueeze(-1)
+
+            max_scores, _ = scores.max(dim=1)
+
+            if len(scores) > self.test_cfg.nms_pre > 0:
+                _, ids = max_scores.topk(self.test_cfg.nms_pre)
+                centers = centers[ids]
+                sizes = sizes[ids]
+                scores = scores[ids]
+            bboxes = self._center_size_pred_to_bbox(centers, sizes)
+            mlvl_bboxes.append(bboxes)
+            mlvl_scores.append(scores)
+
+        bboxes = torch.cat(mlvl_bboxes)
+        scores = torch.cat(mlvl_scores)
+        bboxes_after_nms, scores, labels = self._nms(bboxes, scores,
+                                                     input_meta)  # bboxes(n_box, 6) (x_center, y_center, z_center, w, h, z)
+
+        bboxes = input_meta['box_type_3d'](
+            bboxes_after_nms, box_dim=6, with_yaw=False, origin=(.5, .5, .5))
+
+        results = InstanceData()
+        results.bboxes_3d = bboxes
+        results.scores_3d = scores
+        results.labels_3d = labels
+
+        return results
+
+    def find_max_iou_from_center_size_boxes(self, boxes1, boxes2):
+        boxes1_tp = self._center_size_pred_to_bbox(boxes1[:, :3], boxes1[:, 3:6])
+        boxes2_tp = self._center_size_pred_to_bbox(boxes2[:, :3], boxes2[:, 3:6])
+        giou_2 = axis_aligned_bbox_overlaps_3d(boxes1_tp.unsqueeze(0), boxes2_tp.unsqueeze(0), mode='giou')  # giou
+        giou_max_gt, max_gt_box_idx = torch.max(giou_2, axis=2)
+        max_giou, max_pred_box_idx = torch.max(giou_max_gt, axis=1)
+        assert max_giou <= 1 and max_giou >= -1
+        return max_giou, max_gt_box_idx, max_pred_box_idx
+
+    def _center_size_pred_to_bbox(self, centers, sizes):
+        return torch.stack([
+            centers[:, 0] - sizes[:, 0] / 2.0, centers[:, 1] - sizes[:, 1] / 2.0,
+            centers[:, 2] - sizes[:, 2] / 2.0, centers[:, 0] + sizes[:, 0] / 2.0,
+            centers[:, 1] + sizes[:, 1] / 2.0, centers[:, 2] + sizes[:, 2] / 2.0
+        ], -1)
+
+    def _nms(self, bboxes, scores, img_meta):  # bbox is 6-dim. (x_min, y_min, z_min, x_max, y_max, z_max)
+        scores, labels = scores.max(dim=1)
+        ids = scores > self.test_cfg.score_thr
+        bboxes = bboxes[ids]
+        scores = scores[ids]
+        labels = labels[ids]
+        ids = self.aligned_3d_nms(bboxes, scores, labels,
+                                  self.test_cfg.iou_thr)
+        bboxes = bboxes[ids]
+        bboxes = torch.stack(
+            ((bboxes[:, 0] + bboxes[:, 3]) / 2.,
+             (bboxes[:, 1] + bboxes[:, 4]) / 2.,
+             (bboxes[:, 2] + bboxes[:, 5]) / 2., bboxes[:, 3] - bboxes[:, 0],
+             bboxes[:, 4] - bboxes[:, 1], bboxes[:, 5] - bboxes[:, 2]),
+            dim=1)  # (convert to (x_center, y_center, z_center, w, h, z))
+        return bboxes, scores[ids], labels[ids]
+
+    @staticmethod
+    def aligned_3d_nms(boxes, scores, classes, thresh):
+
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        z1 = boxes[:, 2]
+        x2 = boxes[:, 3]
+        y2 = boxes[:, 4]
+        z2 = boxes[:, 5]
+        area = (x2 - x1) * (y2 - y1) * (z2 - z1)
+        zero = boxes.new_zeros(1, )
+
+        score_sorted = torch.argsort(scores)
+        pick = []
+        while (score_sorted.shape[0] != 0):
+            last = score_sorted.shape[0]
+            i = score_sorted[-1]
+            pick.append(i)
+
+            xx1 = torch.max(x1[i], x1[score_sorted[:last - 1]])
+            yy1 = torch.max(y1[i], y1[score_sorted[:last - 1]])
+            zz1 = torch.max(z1[i], z1[score_sorted[:last - 1]])
+            xx2 = torch.min(x2[i], x2[score_sorted[:last - 1]])
+            yy2 = torch.min(y2[i], y2[score_sorted[:last - 1]])
+            zz2 = torch.min(z2[i], z2[score_sorted[:last - 1]])
+            classes1 = classes[i]
+            classes2 = classes[score_sorted[:last - 1]]
+            inter_l = torch.max(zero, xx2 - xx1)
+            inter_w = torch.max(zero, yy2 - yy1)
+            inter_h = torch.max(zero, zz2 - zz1)
+
+            inter = inter_l * inter_w * inter_h
+            iou = inter / (area[i] + area[score_sorted[:last - 1]] - inter)
+            iou = iou * (classes1 == classes2).float()
+            score_sorted = score_sorted[torch.nonzero(
+                iou <= thresh, as_tuple=False).flatten()]
+
+        indices = boxes.new_tensor(pick, dtype=torch.long)
+        return indices
