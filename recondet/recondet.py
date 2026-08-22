@@ -6,14 +6,14 @@ import torch.nn.functional as F
 from mmcv.ops import furthest_point_sample
 
 from mmdet3d.models.detectors import Base3DDetector
-from mmdet3d.registry import MODELS, TASK_UTILS
+from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
-from recondet.device import autocast, get_device, get_amp_dtype
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
                                                TransformerDecoderLayer)
+from recondet.device import autocast, get_device, get_amp_dtype
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.geometry import unproject_depth_map_to_point_map_torch
 from vggt_omega.utils.pose_enc import encoding_to_camera
@@ -240,7 +240,8 @@ class ReconDet(Base3DDetector):
             return points[batch_indices, indices]
 
     @torch.no_grad()
-    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images, batch_inputs_dict, images_patch_attn):
+    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images,
+                          images_patch_attn):
 
         with torch.no_grad():
             with autocast(images.device):
@@ -257,6 +258,7 @@ class ReconDet(Base3DDetector):
                 )
                 # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
                 extrinsic, intrinsic = encoding_to_camera(pose_enc, images.shape[-2:])
+                predicted_first_w2c = extrinsic[:, 0].detach()
 
                 depth_map, depth_conf = self.vggt_encoder.dense_head(
                     aggregated_tokens_list,
@@ -389,16 +391,14 @@ class ReconDet(Base3DDetector):
                     sampled_point_map_by_unprojection_tensor = self.batch_random_sample(
                         point_map_by_unprojection_tensor, 100000, depth_mask)
 
-                norm_scale = batch_inputs_dict['avg_distance']
-                norm_scale_tensor = torch.stack(norm_scale, dim=0).unsqueeze(-1)
-
                 del point_map_by_unprojection_tensor
-                sampled_point_map_by_unprojection_tensor *= norm_scale_tensor
 
                 if self.if_use_atten_fps:
-                    return sampled_point_map_by_unprojection_tensor.detach(), atten_weights
+                    return (sampled_point_map_by_unprojection_tensor.detach(),
+                            atten_weights, predicted_first_w2c)
                 else:
-                    return sampled_point_map_by_unprojection_tensor.detach(), None
+                    return (sampled_point_map_by_unprojection_tensor.detach(),
+                            None, predicted_first_w2c)
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict, images, images_patch_attn):
 
@@ -440,8 +440,9 @@ class ReconDet(Base3DDetector):
 
         if self.if_use_pred_pc_query:
 
-            pred_pc, atten_weights = self.pred_pc_from_vggt(vggt_token_list, ps_idx, images, batch_inputs_dict,
-                                                            images_patch_attn)
+            pred_pc, atten_weights, predicted_first_w2c = self.pred_pc_from_vggt(
+                vggt_token_list, ps_idx, images, images_patch_attn)
+            batch_inputs_dict['predicted_first_w2c'] = predicted_first_w2c
             if self.if_add_noises:
                 pred_pc = self.add_normalized_noise_to_point_cloud(pred_pc, self.noise_level)
             if self.if_use_atten_fps:

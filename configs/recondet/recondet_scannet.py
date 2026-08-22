@@ -12,6 +12,7 @@ resume = True
 
 data_root = '/root/shared-nvme/data/ScanNet_processed'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
+vggt_scene_scale_file = f'{data_root}/vggt_scene_scales.pkl'
 
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
@@ -59,7 +60,6 @@ model = dict(
         ),
         learn_center_diff=True,
         if_v2_head=True,
-        if_project_frist_frame_back=True,
         matcher='one2more',
         matcher_iou_thres=0.1,
         matcher_max_dynamic_samples=5
@@ -90,14 +90,12 @@ class_names = [
 ]
 
 train_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'points', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'scene_scale'
 ]
 
 test_collect_keys = [
-    'img', 'points', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'scene_scale'
 ]
-
-n_points = 100000
 
 input_modality = dict(
     use_camera=True,
@@ -107,18 +105,7 @@ input_modality = dict(
     use_ray=False)
 
 train_pipeline = [
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='DEPTH',
-        shift_height=False,
-        use_color=True,
-        load_dim=6,
-        use_dim=[0, 1, 2, 3, 4, 5],
-        backend_args=None,
-        data_root=data_root),
     dict(type='LoadAnnotations3D'),
-    # dict(type='GlobalAlignment', rotation_axis=2),
-    dict(type='PointSample', num_points=n_points),
     dict(
         type='MultiViewPipeline_Tgt',
         n_images=42,
@@ -137,25 +124,12 @@ train_pipeline = [
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ]
     ),
-    dict(type='RandomShiftOrigin', std=(.7, .7, .0)),
-    dict(type='ProjectPCtoFirstFrameAndNorm', coord_type='DEPTH'),
-    # dict(type='NormBoxes'),
+    dict(type='LoadVGGTSceneScaleAndPose', scale_file=vggt_scene_scale_file),
     dict(type='PackNeRFDetInputs', keys=train_collect_keys)
 ]
 
 test_pipeline = [
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='DEPTH',
-        shift_height=False,
-        use_color=True,
-        load_dim=6,
-        use_dim=[0, 1, 2, 3, 4, 5],
-        backend_args=None,
-        data_root=data_root),
     dict(type='LoadAnnotations3D'),
-    # dict(type='GlobalAlignment', rotation_axis=2),
-    dict(type='PointSample', num_points=n_points),
     dict(
         type='MultiViewPipeline_Tgt',
         n_images=81,
@@ -174,7 +148,7 @@ test_pipeline = [
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ]
     ),
-    dict(type='ProjectPCtoFirstFrameAndNorm', coord_type='DEPTH'),
+    dict(type='LoadVGGTSceneScaleAndPose', scale_file=vggt_scene_scale_file),
     dict(type='PackNeRFDetInputs', keys=test_collect_keys)
 ]
 

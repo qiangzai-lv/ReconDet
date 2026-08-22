@@ -51,7 +51,7 @@ def to_tensor(
 class PackNeRFDetInputs(BaseTransform):
     INPUTS_KEYS = ['points', 'img']
     NERF_INPUT_KEYS = [
-        'img', 'denorm_images', 'depth', 'lightpos', 'nerf_sizes', 'raydirs', 'c2w', 'intrinsic', 'points', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
+        'img', 'denorm_images', 'depth', 'lightpos', 'nerf_sizes', 'raydirs', 'c2w', 'intrinsic', 'points', 'pose_matrix', 'axis_align_matrix', 'avg_distance', 'scene_scale'
     ]
 
     INSTANCEDATA_3D_KEYS = [
@@ -246,7 +246,7 @@ class PackNeRFDetInputs(BaseTransform):
         for key in [
                 'proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels',
                 'gt_bboxes_labels', 'attr_labels', 'pts_instance_mask',
-                'pts_semantic_mask', 'centers_2d', 'depths', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
+                'pts_semantic_mask', 'centers_2d', 'depths', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'avg_distance', 'scene_scale'
         ]:
             if key not in results:
                 continue

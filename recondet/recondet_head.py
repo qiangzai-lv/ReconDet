@@ -56,7 +56,6 @@ class ReconDetHead(BaseModule):
                                'not_objness_loss': 0.25},
                  learn_center_diff=False,
                  if_v2_head=False,
-                 if_project_frist_frame_back=False,
                  matcher='one2one',
                  matcher_iou_thres=0.25,
                  matcher_max_dynamic_samples=10
@@ -103,7 +102,6 @@ class ReconDetHead(BaseModule):
                                                      matcher_max_dynamic_samples=matcher_max_dynamic_samples)
         self.loss_weights = loss_weights
         self.learn_center_diff = learn_center_diff
-        self.if_project_frist_frame_back = if_project_frist_frame_back
 
     def _init_layers(self, n_channels, n_reg_outs, n_classes, n_levels):
         self.center_head = self.mlp_func(output_dim=3)
@@ -111,56 +109,86 @@ class ReconDetHead(BaseModule):
         self.semcls_head = self.mlp_func(output_dim=n_classes + 1)  # foreground categories
         self.scales = nn.ModuleList([Scale(1.) for _ in range(n_levels)])
 
-    def project_the_first_frame_back(self, x: Tensor, pose_matrix, axis_align_matrix):
-        batch_size, _, num_boxes = x.shape
-        pose_matrix = torch.stack(pose_matrix, dim=0).to(x.device, dtype=x.dtype)  # [16, 4, 4]
-        axis_align_matrix = torch.stack(axis_align_matrix, dim=0).to(x.device, dtype=x.dtype)
-        ones = torch.ones(batch_size, 1, num_boxes, device=x.device)  # [16, 1, 256]
-        x_homogeneous = torch.cat([x, ones], dim=1)  # [16, 4, 256]
-
-        x_global_homogeneous = torch.bmm(pose_matrix, x_homogeneous)  # [16, 4, 256]
-        x_global_homogeneous = torch.bmm(axis_align_matrix, x_global_homogeneous)
-        w = torch.clamp(x_global_homogeneous[:, 3:4, :], min=1e-8)
-        x_global = x_global_homogeneous[:, :3, :] / w
-        return x_global
-
-    def _forward_single(self, x: Tensor, scale: Scale, query_xyz, pose_matrix, axis_align_matrix, avg_distance):
-
+    def _forward_single(self, x: Tensor, scale: Scale, query_xyz):
         if self.learn_center_diff:
             query_xyz = query_xyz.permute(0, 2, 1)
-            if self.if_project_frist_frame_back:
-                center_pred = self.project_the_first_frame_back(self.center_head(x) + query_xyz, pose_matrix,
-                                                                axis_align_matrix)
-            else:
-                center_pred = self.center_head(x) + query_xyz
-
+            center_pred = self.center_head(x) + query_xyz
         else:
-            if self.if_project_frist_frame_back:
-                center_pred = self.project_the_first_frame_back(self.center_head(x), pose_matrix, axis_align_matrix)
-            else:
-                center_pred = self.center_head(x)
+            center_pred = self.center_head(x)
 
-        return (center_pred, torch.exp(scale(self.size_head(x))),  # / avg_distance_tensor,
-                self.semcls_head(x))  # , self.objness_head(x)
+        return (center_pred, torch.exp(scale(self.size_head(x))),
+                self.semcls_head(x))
 
-    def forward(self, x, batch_inputs_dict, batch_data_samples):
+    def forward(self, x, batch_inputs_dict):
         if 'query_xyz' in batch_inputs_dict.keys():
             return multi_apply(self._forward_single, x, self.scales,
-                               [batch_inputs_dict['query_xyz'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['pose_matrix'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['axis_align_matrix'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['avg_distance'] for _ in range(self.n_levels)])
+                               [batch_inputs_dict['query_xyz'] for _ in range(self.n_levels)])
         else:
-            return multi_apply(self._forward_single, x, self.scales, [None for _ in range(self.n_levels)],
-                               [batch_inputs_dict['pose_matrix'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['axis_align_matrix'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['avg_distance'] for _ in range(self.n_levels)])
+            return multi_apply(self._forward_single, x, self.scales,
+                               [None for _ in range(self.n_levels)])
+
+    @staticmethod
+    def _batch_tensor(value, reference):
+        if isinstance(value, torch.Tensor):
+            tensor = value
+        elif isinstance(value, (int, float)):
+            tensor = torch.as_tensor([value])
+        else:
+            tensor = torch.stack([
+                item if isinstance(item, torch.Tensor) else torch.as_tensor(item)
+                for item in value
+            ], dim=0)
+        return tensor.to(device=reference.device, dtype=torch.float32)
+
+    def _transform_bbox_predictions(self, center_preds, size_preds,
+                                    batch_inputs_dict):
+        reference = center_preds[0]
+        pose_matrix = self._batch_tensor(
+            batch_inputs_dict['pose_matrix'], reference)
+        axis_align_matrix = self._batch_tensor(
+            batch_inputs_dict['axis_align_matrix'], reference)
+        predicted_first_w2c = self._batch_tensor(
+            batch_inputs_dict['predicted_first_w2c'], reference)
+        scene_scale = self._batch_tensor(
+            batch_inputs_dict['scene_scale'], reference).reshape(
+                reference.shape[0], 1, 1)
+
+        if pose_matrix.shape[-2:] != (4, 4):
+            raise ValueError('pose_matrix must have shape [B, 4, 4]')
+        if axis_align_matrix.shape[-2:] != (4, 4):
+            raise ValueError('axis_align_matrix must have shape [B, 4, 4]')
+        if predicted_first_w2c.shape[-2:] == (3, 4):
+            bottom_row = predicted_first_w2c.new_zeros(
+                predicted_first_w2c.shape[0], 1, 4)
+            bottom_row[..., 0, 3] = 1
+            predicted_first_w2c = torch.cat(
+                [predicted_first_w2c, bottom_row], dim=1)
+        if predicted_first_w2c.shape[-2:] != (4, 4):
+            raise ValueError(
+                'predicted_first_w2c must have shape [B, 3, 4] or [B, 4, 4]')
+
+        transform = torch.bmm(
+            axis_align_matrix,
+            torch.bmm(pose_matrix, predicted_first_w2c))
+        transformed_centers = []
+        transformed_sizes = []
+        for centers, sizes in zip(center_preds, size_preds):
+            scaled_centers = centers.float() * scene_scale
+            ones = scaled_centers.new_ones(
+                scaled_centers.shape[0], 1, scaled_centers.shape[2])
+            homogeneous_centers = torch.cat([scaled_centers, ones], dim=1)
+            aligned_centers = torch.bmm(
+                transform, homogeneous_centers)[:, :3, :]
+            transformed_centers.append(aligned_centers)
+            transformed_sizes.append(sizes.float() * scene_scale)
+        return transformed_centers, transformed_sizes
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList, batch_inputs_dict: dict,
              **kwargs) -> dict:
 
-        outs = self(x, batch_inputs_dict,
-                    batch_data_samples)  # x len: 8, every tensor shape: [bs, feat_dim, num_queries]
+        center_preds, size_preds, cls_preds = self(x, batch_inputs_dict)
+        center_preds, size_preds = self._transform_bbox_predictions(
+            center_preds, size_preds, batch_inputs_dict)
 
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -176,8 +204,9 @@ class ReconDetHead(BaseModule):
             batch_gt_instances_ignore.append(
                 data_sample.get('ignored_instances', None))
 
-        loss_inputs = outs + (batch_gt_instances_3d,
-                              batch_input_metas, batch_input_points, batch_gt_instances_ignore)
+        loss_inputs = (center_preds, size_preds, cls_preds,
+                       batch_gt_instances_3d, batch_input_metas,
+                       batch_input_points, batch_gt_instances_ignore)
         losses = self.loss_by_feat(*loss_inputs)
         return losses
 
@@ -272,9 +301,11 @@ class ReconDetHead(BaseModule):
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        outs = self(x, batch_inputs_dict, batch_data_samples)
+        center_preds, size_preds, cls_preds = self(x, batch_inputs_dict)
+        center_preds, size_preds = self._transform_bbox_predictions(
+            center_preds, size_preds, batch_inputs_dict)
         predictions = self.predict_by_feat(
-            *outs,
+            center_preds, size_preds, cls_preds,
             batch_input_metas=batch_input_metas,
             rescale=rescale, batch_inputs_dict=batch_inputs_dict, batch_data_samples=batch_data_samples)
         return predictions

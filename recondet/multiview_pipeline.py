@@ -1,5 +1,7 @@
-# Copyright (c) OpenMMLab. All rights reserved.
+from pathlib import Path
+
 import mmcv
+import mmengine
 import numpy as np
 from mmcv.transforms import BaseTransform, Compose
 from PIL import Image
@@ -48,6 +50,32 @@ def read_pose_matrix(file_path):
     except Exception as e:
         print(f"Error reading pose matrix: {e}")
         return None
+
+
+@TRANSFORMS.register_module()
+class LoadVGGTSceneScaleAndPose(BaseTransform):
+    def __init__(self, scale_file):
+        cache = mmengine.load(scale_file)
+        self.scene_scales = cache.get('scenes', cache)
+        if not isinstance(self.scene_scales, dict):
+            raise TypeError(f'Invalid VGGT scene scale cache: {scale_file}')
+
+    def transform(self, results: dict) -> dict:
+        first_img_path = results['img_path'][0]
+        pose_matrix = read_pose_matrix(str(Path(first_img_path).with_suffix('.txt')))
+        if pose_matrix is None:
+            raise ValueError(f'Could not load first-frame pose for {first_img_path}')
+
+        scene_id = Path(results['lidar_points']['lidar_path']).stem
+        if scene_id not in self.scene_scales:
+            raise KeyError(f'VGGT scene scale is missing for {scene_id}')
+        scene_scale = float(self.scene_scales[scene_id]['scale'])
+        if not np.isfinite(scene_scale) or scene_scale <= 0:
+            raise ValueError(f'Invalid VGGT scene scale for {scene_id}: {scene_scale}')
+
+        results['pose_matrix'] = pose_matrix.astype(np.float32)
+        results['scene_scale'] = scene_scale
+        return results
 
 @TRANSFORMS.register_module()
 class ProjectPCtoFirstFrameAndNorm(BaseTransform):
