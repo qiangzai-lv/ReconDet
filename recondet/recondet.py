@@ -3,16 +3,16 @@ from typing import List, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mmcv.ops import furthest_point_sample
 
-from detr3_models.helpers import GenericMLP
-from detr3_models.position_embedding import PositionEmbeddingCoordsSine
-from detr3_models.third_party_pointnet2.pointnet2.pointnet2_utils import furthest_point_sample
-from detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
-                                      TransformerDecoderLayer)
 from mmdet3d.models.detectors import Base3DDetector
 from mmdet3d.registry import MODELS, TASK_UTILS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
+from recondet.detr3_models.helpers import GenericMLP
+from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
+from recondet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
+                                               TransformerDecoderLayer)
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map_torch
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -65,7 +65,6 @@ class ReconDet(Base3DDetector):
     def __init__(
             self,
             bbox_head: ConfigType,
-            prior_generator: ConfigType,
             train_cfg: OptConfigType = None,
             test_cfg: OptConfigType = None,
             data_preprocessor: OptConfigType = None,
@@ -88,7 +87,7 @@ class ReconDet(Base3DDetector):
             if_task_query=False,
             if_add_noises=False,
             noise_level=None,
-            vggt_weight_path = None,
+            vggt_weight_path=None,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -152,8 +151,6 @@ class ReconDet(Base3DDetector):
                 self.proj_feat_dim3 = ChannelProjecter(in_channels=2048, out_channels=token_dim)
             else:
                 self.proj_feat_dim = ChannelProjecter(in_channels=2048, out_channels=token_dim)
-
-        self.prior_generator = TASK_UTILS.build(prior_generator)
 
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg

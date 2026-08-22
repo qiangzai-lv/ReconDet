@@ -10,8 +10,8 @@ from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
 
-from detr3_models.helpers import GenericMLP
-from mmdet3d.registry import MODELS, TASK_UTILS
+from recondet.detr3_models.helpers import GenericMLP
+from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
 from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
@@ -43,7 +43,6 @@ class ReconDetHead(BaseModule):
                  n_reg_outs: int,
                  pts_assign_threshold: int,
                  pts_center_threshold: int,
-                 prior_generator: ConfigType,
                  objness_loss: ConfigType = dict(type='mmdet.FocalLoss', use_sigmoid=True),
                  train_cfg: OptConfigType = None,
                  test_cfg: OptConfigType = None,
@@ -68,7 +67,6 @@ class ReconDetHead(BaseModule):
         self.n_reg_outs = n_reg_outs
         self.pts_assign_threshold = pts_assign_threshold
         self.pts_center_threshold = pts_center_threshold
-        self.prior_generator = TASK_UTILS.build(prior_generator)
         class_weights = torch.ones((self.n_classes + 1), device='cuda') * 1.0
         class_weights[-1] = loss_weights['not_objness_loss']
         self.cls_loss = nn.CrossEntropyLoss(weight=class_weights)  # MODELS.build(cls_loss)

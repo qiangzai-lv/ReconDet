@@ -2,7 +2,7 @@ _base_ = ['../_base_/default_runtime.py']
 
 resume = True
 
-data_root = './data/scannet/'
+data_root = '/root/shared-nvme/data/ScanNet_processed'
 vggt_weight_path = '/root/shared-nvme/data/VGGT-1B'
 
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
@@ -91,6 +91,13 @@ test_collect_keys = [
 
 n_points = 100000
 
+input_modality = dict(
+    use_camera=True,
+    use_depth=False,
+    use_lidar=False,
+    use_neuralrecon_depth=False,
+    use_ray=False)
+
 train_pipeline = [
     dict(
         type='LoadPointsFromFile',
@@ -164,7 +171,7 @@ test_pipeline = [
 ]
 
 train_dataloader = dict(
-    batch_size=10,
+    batch_size=1,
     num_workers=8,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
@@ -176,7 +183,7 @@ train_dataloader = dict(
             data_root=data_root,
             ann_file='scannet_infos_train_pts.pkl',
             pipeline=train_pipeline,
-            modality=dict(use_depth=False),
+            modality=input_modality,
             test_mode=False,
             filter_empty_gt=True,
             box_type_3d='Depth',
@@ -193,7 +200,7 @@ val_dataloader = dict(
         data_root=data_root,
         ann_file='scannet_infos_val_pts.pkl',
         pipeline=test_pipeline,
-        modality=dict(use_depth=False),
+        modality=input_modality,
         test_mode=True,
         filter_empty_gt=True,
         box_type_3d='Depth',
@@ -205,7 +212,7 @@ test_evaluator = val_evaluator
 
 # train cfg
 _warm_epoch = 0
-_max_epoch = 400
+_max_epoch = 200
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=2)
 test_cfg = dict()
 val_cfg = dict()
