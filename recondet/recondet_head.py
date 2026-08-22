@@ -67,7 +67,7 @@ class ReconDetHead(BaseModule):
         self.n_reg_outs = n_reg_outs
         self.pts_assign_threshold = pts_assign_threshold
         self.pts_center_threshold = pts_center_threshold
-        class_weights = torch.ones((self.n_classes + 1), device='cuda') * 1.0
+        class_weights = torch.ones((self.n_classes + 1))
         class_weights[-1] = loss_weights['not_objness_loss']
         self.cls_loss = nn.CrossEntropyLoss(weight=class_weights)  # MODELS.build(cls_loss)
         self.objness_loss = MODELS.build(objness_loss)

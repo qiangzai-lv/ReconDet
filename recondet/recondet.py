@@ -9,6 +9,7 @@ from mmdet3d.models.detectors import Base3DDetector
 from mmdet3d.registry import MODELS, TASK_UTILS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
+from recondet.device import autocast, get_device, get_amp_dtype
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
@@ -17,8 +18,7 @@ from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map_torch
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-vggt_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+device = get_device()
 
 
 class ChannelProjecter(nn.Module):
@@ -201,8 +201,8 @@ class ReconDet(Base3DDetector):
             self.vggt_encoder.eval()
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
-                img = batch_inputs_dict['imgs']  # (bs, 40, 3, 392, 518)
+            img = batch_inputs_dict['imgs']  # (bs, 40, 3, 392, 518)
+            with autocast(img.device):
                 img = img.float()
                 if self.if_use_atten_sample or self.if_use_atten_fps:
                     aggregated_tokens_list, ps_idx, images_patch_attn = self.vggt_encoder.aggregator(img, if_norm=False,
@@ -245,14 +245,14 @@ class ReconDet(Base3DDetector):
     def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images, batch_inputs_dict, images_patch_attn):
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
+            with autocast(images.device):
                 if not aggregated_tokens_list_ori[0].is_contiguous():
                     aggregated_tokens_list = [i.contiguous() for i in aggregated_tokens_list_ori]
                     del aggregated_tokens_list_ori
                 else:
                     aggregated_tokens_list = aggregated_tokens_list_ori
 
-            with torch.cuda.amp.autocast(enabled=False):
+            with autocast(images.device, enabled=False):
 
                 pose_enc = self.vggt_encoder.camera_head(aggregated_tokens_list)[-1]
                 # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
@@ -486,7 +486,7 @@ class ReconDet(Base3DDetector):
                                                                             'train')
 
         if self.if_mix_precision:
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
+            with autocast(img.device):
                 box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
         else:
             box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
@@ -501,7 +501,7 @@ class ReconDet(Base3DDetector):
                                                                             'train')
 
         if self.if_mix_precision:
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
+            with autocast(img.device):
                 box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
         else:
             box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
@@ -520,7 +520,7 @@ class ReconDet(Base3DDetector):
                                                                             'train')
 
         if self.if_mix_precision:
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
+            with autocast(img.device):
                 box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
         else:
             box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
@@ -566,7 +566,7 @@ class ReconDet(Base3DDetector):
         assert points.dim() == 3, "the shape of points should be [B, N, 3]"
         assert attention_weights.shape == points.shape[:2], "the shape of attention_weights should be [B, N]"
 
-        with torch.cuda.amp.autocast(dtype=vggt_dtype if use_amp else None):
+        with autocast(points.device, enabled=use_amp):
             B, N, _ = points.shape
             device = points.device
             batch_idx = torch.arange(B, device=device)[:, None]
@@ -577,13 +577,14 @@ class ReconDet(Base3DDetector):
             weights_min = attention_weights.min(1, keepdim=True).values
             weights_max = attention_weights.max(1, keepdim=True).values
             weights_norm = (attention_weights - weights_min) / (weights_max - weights_min + 1e-8)
-            weights_norm = weights_norm.to(vggt_dtype)
+            amp_dtype = get_amp_dtype(points.device)
+            weights_norm = weights_norm.to(amp_dtype)
 
             first_idx = torch.argmax(weights_norm, dim=1)
             indices[:, 0] = first_idx
             mask[batch_idx, first_idx.unsqueeze(1)] = False
 
-            min_dists = torch.full((B, N), float('inf'), dtype=vggt_dtype, device=device)
+            min_dists = torch.full((B, N), float('inf'), dtype=amp_dtype, device=device)
 
             for k in range(1, num_samples):
                 current_point = points.gather(1, indices[:, k - 1].view(-1, 1, 1).expand(-1, -1, 3))
@@ -592,7 +593,7 @@ class ReconDet(Base3DDetector):
                     dist_chunk = torch.norm(chunk - current_point, dim=-1)
                     min_dists[:, i:i + chunk_size] = torch.min(
                         min_dists[:, i:i + chunk_size],
-                        dist_chunk.to(vggt_dtype)
+                        dist_chunk.to(amp_dtype)
                     )
 
                 dist_min = min_dists.min(1, keepdim=True).values
@@ -607,7 +608,8 @@ class ReconDet(Base3DDetector):
                 mask[batch_idx, next_idx.unsqueeze(1)] = False
 
                 if verbose and k % 10 == 0:
-                    mem = torch.cuda.memory_allocated() / 1024 ** 3
+                    backend = getattr(torch, points.device.type, None)
+                    mem = backend.memory_allocated() / 1024 ** 3 if backend is not None else 0.0
                     print(f"Step {k}: Mem {mem:.2f}GB | Min Dist {min_dists.min().item():.4f}")
 
         return indices
