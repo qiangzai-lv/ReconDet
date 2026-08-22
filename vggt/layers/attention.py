@@ -64,35 +64,12 @@ class Attention(nn.Module):
         #########
 
         if save_vis_attn:
-            # import time
-            # import torch
-            # start_event = torch.cuda.Event(enable_timing=True)
-            # end_event = torch.cuda.Event(enable_timing=True)
-
-            # start_event.record()
-            # self.last_attn = torch.softmax(q @ k.transpose(-2, -1) * self.scale, dim=-1)
-
-            seq_len = q.size(-2)  # 773
-            identity_v = torch.eye(
-                seq_len,
-                device=q.device,
-                dtype=q.dtype
-            )  # shape [773, 773]
-
-            identity_v = identity_v.view(1, 1, seq_len, seq_len)             # [1, 1, 773, 773]
-            identity_v = identity_v.expand(q.shape[0], q.shape[1], seq_len, seq_len) 
-
-            self.last_attn = F.scaled_dot_product_attention(
-                q,
-                k,
-                identity_v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-            )
-            del identity_v
-            # end_event.record()
-            # torch.cuda.synchronize()
-            # print(1)
-            # print(f"Attention computation time: {start_event.elapsed_time(end_event):.3f} ms")
+            # Passing an identity matrix as V extracts the attention matrix
+            # from SDPA, but makes V's head dimension equal to sequence length.
+            # NPU flash attention requires V's head dimension to be no larger
+            # than Q/K's, so compute this visualization-only value explicitly.
+            attn = (q * self.scale) @ k.transpose(-2, -1)
+            self.last_attn = self.attn_drop(attn.softmax(dim=-1))
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
