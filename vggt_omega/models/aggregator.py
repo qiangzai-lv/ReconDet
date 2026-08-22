@@ -100,7 +100,8 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
-    ) -> tuple[list[torch.Tensor | None], int]:
+        return_patch_attention: bool = False,
+    ) -> tuple[list[torch.Tensor | None], int] | tuple[list[torch.Tensor | None], int, torch.Tensor]:
         batch_size, num_frames, num_channels, height, width = images.shape
         if num_channels != 3:
             raise ValueError(f"Expected 3 input channels, got {num_channels}")
@@ -136,6 +137,7 @@ class Aggregator(nn.Module):
                 embed_dim,
                 block_idx,
                 frame_rope,
+                capture_attention=return_patch_attention and block_idx == 0,
             )
             tokens = self._run_inter_frame_attention_block(
                 tokens,
@@ -151,6 +153,14 @@ class Aggregator(nn.Module):
             else:
                 outputs.append(None)
 
+        if return_patch_attention:
+            attention_module = self.frame_blocks[0].attn
+            if not hasattr(attention_module, "last_attention_mean"):
+                raise RuntimeError("Frame attention weights were not captured")
+            patch_attention = attention_module.last_attention_mean[:, self.patch_token_start :]
+            del attention_module.last_attention_mean
+            return outputs, self.patch_token_start, patch_attention
+
         return outputs, self.patch_token_start
 
     def _run_frame_block(
@@ -162,9 +172,14 @@ class Aggregator(nn.Module):
         embed_dim: int,
         block_idx: int,
         rope_sincos: tuple[torch.Tensor, torch.Tensor],
+        capture_attention: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
-        tokens = self.frame_blocks[block_idx](tokens, rope_sincos)
+        tokens = self.frame_blocks[block_idx](
+            tokens,
+            rope_sincos,
+            capture_attention=capture_attention,
+        )
         return tokens, tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
     def _run_inter_frame_attention_block(

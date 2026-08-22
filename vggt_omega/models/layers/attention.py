@@ -101,9 +101,20 @@ class SelfAttention(nn.Module):
         k = k.to(dtype=k_dtype)
         return q, k
 
-    def forward(self, x: Tensor, attn_bias=None, rope: Tensor = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        attn_bias=None,
+        rope: Tensor = None,
+        capture_attention: bool = False,
+    ) -> Tensor:
         qkv = self.qkv(x)
-        attn_v = self.compute_attention(qkv=qkv, attn_bias=attn_bias, rope=rope)
+        attn_v = self.compute_attention(
+            qkv=qkv,
+            attn_bias=attn_bias,
+            rope=rope,
+            capture_attention=capture_attention,
+        )
         x = self.proj(attn_v)
         x = self.proj_drop(x)
         return x
@@ -120,7 +131,13 @@ class SelfAttention(nn.Module):
         x_flat = self.proj(x_flat)
         return uncat_with_shapes(x_flat, shapes, num_tokens)
 
-    def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
+    def compute_attention(
+        self,
+        qkv: Tensor,
+        attn_bias=None,
+        rope=None,
+        capture_attention: bool = False,
+    ) -> Tensor:
         assert attn_bias is None
         B, N, _ = qkv.shape
         C = self.qkv.in_features
@@ -133,6 +150,10 @@ class SelfAttention(nn.Module):
             k = self.k_norm(k)
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
+        if capture_attention:
+            attention = ((q * self.scale) @ k.transpose(-2, -1)).softmax(dim=-1)
+            attention = self.attn_drop(attention)
+            self.last_attention_mean = attention.mean(dim=1).mean(dim=1)
         x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])

@@ -86,7 +86,7 @@ class SelfAttentionBlock(nn.Module):
             # No batch dimension, do not index
             return sin, cos  # [heads, patches, embed_dim] or [patches, embed_dim]
 
-    def _forward(self, x: Tensor, rope=None) -> Tensor:
+    def _forward(self, x: Tensor, rope=None, capture_attention: bool = False) -> Tensor:
         """
         This is the reference implementation for a single tensor, matching what is done below for a list.
         We call the list op on [x] instead of this function.
@@ -100,7 +100,11 @@ class SelfAttentionBlock(nn.Module):
 
             x_subset_1 = x[indices_1]
             rope_subset = self._maybe_index_rope(rope, indices_1)
-            residual_1 = self.attn(self.norm1(x_subset_1), rope=rope_subset)
+            residual_1 = self.attn(
+                self.norm1(x_subset_1),
+                rope=rope_subset,
+                capture_attention=capture_attention,
+            )
 
             x_attn = torch.index_add(
                 x,
@@ -123,12 +127,23 @@ class SelfAttentionBlock(nn.Module):
                 alpha=residual_scale_factor,
             )
         else:
-            x_attn = x + self.ls1(self.attn(self.norm1(x), rope=rope))
+            x_attn = x + self.ls1(
+                self.attn(
+                    self.norm1(x),
+                    rope=rope,
+                    capture_attention=capture_attention,
+                )
+            )
             x_ffn = x_attn + self.ls2(self.mlp(self.norm2(x_attn)))
 
         return x_ffn
 
-    def _forward_list(self, x_list: List[Tensor], rope_list=None) -> List[Tensor]:
+    def _forward_list(
+        self,
+        x_list: List[Tensor],
+        rope_list=None,
+        capture_attention: bool = False,
+    ) -> List[Tensor]:
         """
         This list operator concatenates the tokens from the list of inputs together to save
         on the elementwise operations. Torch-compile memory-planning allows hiding the overhead
@@ -154,6 +169,8 @@ class SelfAttentionBlock(nn.Module):
 
             flattened, shapes, num_tokens = cat_keep_shapes(x_subset_1_list)
             norm1 = uncat_with_shapes(self.norm1(flattened), shapes, num_tokens)
+            if capture_attention:
+                raise RuntimeError("Attention capture is only supported in evaluation mode")
             residual_1_list = self.attn.forward_list(norm1, rope_list=rope_subset_list)
 
             x_attn_list = [
@@ -195,24 +212,43 @@ class SelfAttentionBlock(nn.Module):
         else:
             x_out = []
             for x, rope in zip(x_list, rope_list):
-                x_attn = x + self.ls1(self.attn(self.norm1(x), rope=rope))
+                x_attn = x + self.ls1(
+                    self.attn(
+                        self.norm1(x),
+                        rope=rope,
+                        capture_attention=capture_attention,
+                    )
+                )
                 x_ffn = x_attn + self.ls2(self.mlp(self.norm2(x_attn)))
                 x_out.append(x_ffn)
             x_ffn = x_out
 
         return x_ffn
 
-    def forward(self, x_or_x_list, rope_or_rope_list=None) -> List[Tensor]:
+    def forward(
+        self,
+        x_or_x_list,
+        rope_or_rope_list=None,
+        capture_attention: bool = False,
+    ) -> List[Tensor]:
         if isinstance(x_or_x_list, Tensor):
             # for reference:
             # return self._forward(x_or_x_list, rope=rope_or_rope_list)
             # in order to match implementations we call the list op:
-            return self._forward_list([x_or_x_list], rope_list=[rope_or_rope_list])[0]
+            return self._forward_list(
+                [x_or_x_list],
+                rope_list=[rope_or_rope_list],
+                capture_attention=capture_attention,
+            )[0]
         elif isinstance(x_or_x_list, list):
             if rope_or_rope_list is None:
                 rope_or_rope_list = [None for x in x_or_x_list]
             # return [self._forward(x, rope=rope) for x, rope in zip(x_or_x_list, rope_or_rope_list)]
-            return self._forward_list(x_or_x_list, rope_list=rope_or_rope_list)
+            return self._forward_list(
+                x_or_x_list,
+                rope_list=rope_or_rope_list,
+                capture_attention=capture_attention,
+            )
         else:
             raise AssertionError
 

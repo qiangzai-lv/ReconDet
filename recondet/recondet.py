@@ -14,9 +14,9 @@ from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
                                                TransformerDecoderLayer)
-from vggt.models.vggt import VGGT
-from vggt.utils.geometry import unproject_depth_map_to_point_map_torch
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt_omega.models import VGGTOmega
+from vggt_omega.utils.geometry import unproject_depth_map_to_point_map_torch
+from vggt_omega.utils.pose_enc import encoding_to_camera
 
 device = get_device()
 
@@ -87,7 +87,7 @@ class ReconDet(Base3DDetector):
             if_task_query=False,
             if_add_noises=False,
             noise_level=None,
-            vggt_weight_path=None,
+            vggt_omega_checkpoint=None,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -96,7 +96,11 @@ class ReconDet(Base3DDetector):
         bbox_head.update(test_cfg=test_cfg)
         self.bbox_head = MODELS.build(bbox_head)
 
-        self.vggt_encoder = VGGT.from_pretrained(vggt_weight_path).to(device)
+        self.vggt_encoder = VGGTOmega()
+        self.vggt_encoder.load_state_dict(
+            torch.load(vggt_omega_checkpoint, map_location='cpu', weights_only=True)
+        )
+        self.vggt_encoder.to(device)
 
         for param in self.vggt_encoder.parameters():
             param.requires_grad = False
@@ -201,24 +205,18 @@ class ReconDet(Base3DDetector):
             self.vggt_encoder.eval()
 
         with torch.no_grad():
-            img = batch_inputs_dict['imgs']  # (bs, 40, 3, 392, 518)
+            # The data preprocessor converts raw BGR uint8 images to RGB without
+            # normalization. VGGT-Omega expects RGB values in [0, 1].
+            img = batch_inputs_dict['imgs'].float().div(255.0)
             with autocast(img.device):
-                img = img.float()
                 if self.if_use_atten_sample or self.if_use_atten_fps:
-                    aggregated_tokens_list, ps_idx, images_patch_attn = self.vggt_encoder.aggregator(img, if_norm=False,
-                                                                                                     if_detach=True,
-                                                                                                     if_only_last_layer=(
-                                                                                                         not self.use_multi_layers),
-                                                                                                     if_use_atten_sample=True,
-                                                                                                     if_task_query=self.if_task_query)  # if_norm=False because we have norm it in the data layer
+                    aggregated_tokens_list, ps_idx, images_patch_attn = self.vggt_encoder.aggregator(
+                        img,
+                        return_patch_attention=True,
+                    )
                     return aggregated_tokens_list, ps_idx, img, images_patch_attn
                 else:
-                    aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(img, if_norm=False,
-                                                                                  if_detach=True,
-                                                                                  if_only_last_layer=(
-                                                                                      not self.use_multi_layers),
-                                                                                  if_use_atten_sample=False,
-                                                                                  if_task_query=self.if_task_query)
+                    aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(img)
                     return aggregated_tokens_list, ps_idx, img, None
 
     @torch.no_grad()
@@ -246,19 +244,25 @@ class ReconDet(Base3DDetector):
 
         with torch.no_grad():
             with autocast(images.device):
-                if not aggregated_tokens_list_ori[0].is_contiguous():
-                    aggregated_tokens_list = [i.contiguous() for i in aggregated_tokens_list_ori]
-                    del aggregated_tokens_list_ori
-                else:
-                    aggregated_tokens_list = aggregated_tokens_list_ori
+                aggregated_tokens_list = [
+                    token.contiguous() if token is not None else None
+                    for token in aggregated_tokens_list_ori
+                ]
 
             with autocast(images.device, enabled=False):
 
-                pose_enc = self.vggt_encoder.camera_head(aggregated_tokens_list)[-1]
+                pose_enc = self.vggt_encoder.camera_head(
+                    aggregated_tokens_list,
+                    patch_token_start=ps_idx,
+                )
                 # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
-                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+                extrinsic, intrinsic = encoding_to_camera(pose_enc, images.shape[-2:])
 
-                depth_map, depth_conf = self.vggt_encoder.depth_head(aggregated_tokens_list, images, ps_idx)
+                depth_map, depth_conf = self.vggt_encoder.dense_head(
+                    aggregated_tokens_list,
+                    images,
+                    patch_token_start=ps_idx,
+                )
                 del aggregated_tokens_list
 
                 assert depth_map.shape[-1] == 1
@@ -400,7 +404,10 @@ class ReconDet(Base3DDetector):
 
         if self.use_multi_layers:
             x = []
-            for idx_layer, tokens in enumerate(vggt_token_list):
+            cached_tokens = [tokens for tokens in vggt_token_list if tokens is not None]
+            if len(cached_tokens) != 4:
+                raise ValueError(f'VGGT-Omega must provide 4 cached feature layers, got {len(cached_tokens)}')
+            for idx_layer, tokens in enumerate(cached_tokens):
                 tokens_permute = tokens.permute(0, 3, 1, 2).contiguous()
                 patch_tokens = tokens_permute[:, :, :, ps_idx:]
                 if idx_layer == 0:
@@ -411,8 +418,6 @@ class ReconDet(Base3DDetector):
                     patch_tokens_projected = self.proj_feat_dim2(patch_tokens)
                 elif idx_layer == 3:
                     patch_tokens_projected = self.proj_feat_dim3(patch_tokens)
-                elif idx_layer == 4:
-                    patch_tokens_projected = self.proj_feat_dim4(patch_tokens)
                 del patch_tokens
 
                 batch_size, feat_dim, im_num, token_num = patch_tokens_projected.shape

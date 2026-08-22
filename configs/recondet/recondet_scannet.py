@@ -1,24 +1,32 @@
 _base_ = ['../_base_/default_runtime.py']
 
+import torch
+
+try:
+    import torch_npu  # noqa: F401
+    _dist_backend_ = 'hccl' if torch.npu.is_available() else 'nccl'
+except ImportError:
+    _dist_backend_ = 'nccl'
+
 resume = True
 
 data_root = '/root/shared-nvme/data/ScanNet_processed'
-vggt_weight_path = '/root/shared-nvme/data/VGGT-1B'
+vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
+
+env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
 
 _token_dim_ = 512
 _decoder_layer_num = 8
 model = dict(
     type='ReconDet',
-    vggt_weight_path=vggt_weight_path,
+    vggt_omega_checkpoint=vggt_omega_checkpoint,
     data_preprocessor=dict(
         type='VGGTDetDataPreprocessor',
-        mean=[123.675, 116.28, 103.53],  # 和vggt一致的
-        std=[58.395, 57.12, 57.375],  # 和vggt一致的
         bgr_to_rgb=True,
-        pad_size_divisor=14,  # size can be devided by 14. 这里可能要考虑下，是不是resize的时候就注意点。
-        pad_value=1.0),  # 应该是1还是255呢？应该是1，因为前面已经norm过了，变换到[0, 1]了
+        pad_size_divisor=16,
+        pad_value=0),
     decoder_cfg=dict(  # the same with 3detr
         dec_dim=_token_dim_,
         dec_nhead=4,
