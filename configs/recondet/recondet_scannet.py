@@ -8,10 +8,11 @@ try:
 except ImportError:
     _dist_backend_ = 'nccl'
 
-resume = True
+resume = False
 
 data_root = '/root/shared-nvme/data/ScanNet_processed'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
+vggt_scene_scale_file = f'{data_root}/vggt_scene_scales.pkl'
 
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
@@ -34,6 +35,7 @@ model = dict(
         dec_dropout=0.1,
         dec_nlayers=_decoder_layer_num
     ),
+    deformable_num_points=4,
     bbox_head=dict(
         type='ReconDetHead',
         n_classes=18,
@@ -59,12 +61,12 @@ model = dict(
         ),
         learn_center_diff=True,
         if_v2_head=True,
-        if_project_frist_frame_back=True,
         matcher='one2more',
         matcher_iou_thres=0.1,
-        matcher_max_dynamic_samples=5
+        matcher_max_dynamic_samples=5,
+        loss_layer_ids=list(range(_decoder_layer_num))
     ),
-    num_queries=256,
+    num_queries=900,
     token_dim=_token_dim_,
     test_only_last_layer=True,
     if_mix_precision=True,
@@ -75,7 +77,7 @@ model = dict(
     atten_sample_ratio=10,
     if_use_atten_fps=True,
     lambda_dist=0.8,
-    if_task_query=True,
+    if_task_query=False,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
 )
@@ -90,14 +92,12 @@ class_names = [
 ]
 
 train_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'points', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'scene_scale'
 ]
 
 test_collect_keys = [
-    'img', 'points', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'scene_scale'
 ]
-
-n_points = 100000
 
 input_modality = dict(
     use_camera=True,
@@ -107,18 +107,7 @@ input_modality = dict(
     use_ray=False)
 
 train_pipeline = [
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='DEPTH',
-        shift_height=False,
-        use_color=True,
-        load_dim=6,
-        use_dim=[0, 1, 2, 3, 4, 5],
-        backend_args=None,
-        data_root=data_root),
     dict(type='LoadAnnotations3D'),
-    # dict(type='GlobalAlignment', rotation_axis=2),
-    dict(type='PointSample', num_points=n_points),
     dict(
         type='MultiViewPipeline_Tgt',
         n_images=42,
@@ -137,25 +126,12 @@ train_pipeline = [
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ]
     ),
-    dict(type='RandomShiftOrigin', std=(.7, .7, .0)),
-    dict(type='ProjectPCtoFirstFrameAndNorm', coord_type='DEPTH'),
-    # dict(type='NormBoxes'),
+    dict(type='LoadVGGTSceneScaleAndPose', scale_file=vggt_scene_scale_file),
     dict(type='PackNeRFDetInputs', keys=train_collect_keys)
 ]
 
 test_pipeline = [
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='DEPTH',
-        shift_height=False,
-        use_color=True,
-        load_dim=6,
-        use_dim=[0, 1, 2, 3, 4, 5],
-        backend_args=None,
-        data_root=data_root),
     dict(type='LoadAnnotations3D'),
-    # dict(type='GlobalAlignment', rotation_axis=2),
-    dict(type='PointSample', num_points=n_points),
     dict(
         type='MultiViewPipeline_Tgt',
         n_images=81,
@@ -174,7 +150,7 @@ test_pipeline = [
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ]
     ),
-    dict(type='ProjectPCtoFirstFrameAndNorm', coord_type='DEPTH'),
+    dict(type='LoadVGGTSceneScaleAndPose', scale_file=vggt_scene_scale_file),
     dict(type='PackNeRFDetInputs', keys=test_collect_keys)
 ]
 

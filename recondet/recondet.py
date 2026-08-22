@@ -6,14 +6,13 @@ import torch.nn.functional as F
 from mmcv.ops import furthest_point_sample
 
 from mmdet3d.models.detectors import Base3DDetector
-from mmdet3d.registry import MODELS, TASK_UTILS
+from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
-from recondet.device import autocast, get_device, get_amp_dtype
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
-from recondet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
-                                               TransformerDecoderLayer)
+from recondet.device import autocast, get_device, get_amp_dtype
+from recondet.geometry_attention import GeometryAwareDeformableDecoder
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.geometry import unproject_depth_map_to_point_map_torch
 from vggt_omega.utils.pose_enc import encoding_to_camera
@@ -88,6 +87,7 @@ class ReconDet(Base3DDetector):
             if_add_noises=False,
             noise_level=None,
             vggt_omega_checkpoint=None,
+            deformable_num_points=4,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -107,7 +107,14 @@ class ReconDet(Base3DDetector):
 
         self.vggt_encoder.eval()
 
-        self.decoder = build_decoder(decoder_cfg, if_multilevel=use_multi_layers)
+        self.decoder = GeometryAwareDeformableDecoder(
+            embed_dims=token_dim,
+            num_layers=decoder_cfg['dec_nlayers'],
+            num_heads=decoder_cfg['dec_nhead'],
+            feedforward_channels=decoder_cfg['dec_ffn_dim'],
+            num_feature_levels=4 if use_multi_layers else 1,
+            num_points=deformable_num_points,
+            dropout=decoder_cfg['dec_dropout'])
 
         if if_simpler_project:
             if use_multi_layers:
@@ -161,11 +168,11 @@ class ReconDet(Base3DDetector):
 
         self.num_queries = num_queries
 
-        self.if_task_query = if_task_query
         if if_task_query:
-            self.task_query = nn.Parameter(torch.Tensor(1, token_dim))
-            nn.init.xavier_normal_(self.task_query)
-        ######### idea 2 ############
+            raise ValueError(
+                'task_query has no projectable 3D reference point and is not '
+                'supported by projected deformable attention')
+        self.if_task_query = False
         self.test_only_last_layer = test_only_last_layer
 
         self.if_use_pred_pc_query = if_use_pred_pc_query
@@ -240,7 +247,8 @@ class ReconDet(Base3DDetector):
             return points[batch_indices, indices]
 
     @torch.no_grad()
-    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images, batch_inputs_dict, images_patch_attn):
+    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images,
+                          images_patch_attn):
 
         with torch.no_grad():
             with autocast(images.device):
@@ -257,6 +265,7 @@ class ReconDet(Base3DDetector):
                 )
                 # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
                 extrinsic, intrinsic = encoding_to_camera(pose_enc, images.shape[-2:])
+                predicted_first_w2c = extrinsic[:, 0].detach()
 
                 depth_map, depth_conf = self.vggt_encoder.dense_head(
                     aggregated_tokens_list,
@@ -324,7 +333,7 @@ class ReconDet(Base3DDetector):
                     sampled_point_map_by_unprojection_tensor = self.batch_random_sample(
                         sampled_point_map_by_unprojection_tensor, 100000)
 
-                    del extrinsic, intrinsic, depth_map, depth_conf, pose_enc
+                    del depth_map, depth_conf, pose_enc
 
                 elif self.if_use_atten_fps:
                     images_patch_attn = images_patch_attn.float()
@@ -374,7 +383,7 @@ class ReconDet(Base3DDetector):
                     sampled_point_map_by_unprojection_tensor, atten_weights = self.batch_random_sample(
                         point_map_by_unprojection_tensor, 100000, weights=prob_dist)
 
-                    del extrinsic, intrinsic, depth_map, depth_conf, pose_enc, prob_dist
+                    del depth_map, depth_conf, pose_enc, prob_dist
 
                 else:
                     point_map_by_unprojection_tensor = unproject_depth_map_to_point_map_torch(depth_map, extrinsic,
@@ -384,88 +393,112 @@ class ReconDet(Base3DDetector):
                     depth_mask = depth_map > self.depth_thres
                     depth_mask = depth_mask.reshape(point_map_by_unprojection_tensor.shape[0], -1)
 
-                    del extrinsic, intrinsic, depth_map, depth_conf, pose_enc
+                    del depth_map, depth_conf, pose_enc
 
                     sampled_point_map_by_unprojection_tensor = self.batch_random_sample(
                         point_map_by_unprojection_tensor, 100000, depth_mask)
 
-                norm_scale = batch_inputs_dict['avg_distance']
-                norm_scale_tensor = torch.stack(norm_scale, dim=0).unsqueeze(-1)
-
                 del point_map_by_unprojection_tensor
-                sampled_point_map_by_unprojection_tensor *= norm_scale_tensor
 
                 if self.if_use_atten_fps:
-                    return sampled_point_map_by_unprojection_tensor.detach(), atten_weights
+                    return (sampled_point_map_by_unprojection_tensor.detach(),
+                            atten_weights, predicted_first_w2c,
+                            extrinsic.detach(), intrinsic.detach())
                 else:
-                    return sampled_point_map_by_unprojection_tensor.detach(), None
+                    return (sampled_point_map_by_unprojection_tensor.detach(),
+                            None, predicted_first_w2c,
+                            extrinsic.detach(), intrinsic.detach())
 
-    def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict, images, images_patch_attn):
-
+    def _build_patch_feature_maps(self, vggt_token_list, ps_idx,
+                                  image_shape):
+        cached_tokens = [
+            tokens for tokens in vggt_token_list if tokens is not None
+        ]
         if self.use_multi_layers:
-            x = []
-            cached_tokens = [tokens for tokens in vggt_token_list if tokens is not None]
             if len(cached_tokens) != 4:
-                raise ValueError(f'VGGT-Omega must provide 4 cached feature layers, got {len(cached_tokens)}')
-            for idx_layer, tokens in enumerate(cached_tokens):
-                tokens_permute = tokens.permute(0, 3, 1, 2).contiguous()
-                patch_tokens = tokens_permute[:, :, :, ps_idx:]
-                if idx_layer == 0:
-                    patch_tokens_projected = self.proj_feat_dim0(patch_tokens)
-                elif idx_layer == 1:
-                    patch_tokens_projected = self.proj_feat_dim1(patch_tokens)
-                elif idx_layer == 2:
-                    patch_tokens_projected = self.proj_feat_dim2(patch_tokens)
-                elif idx_layer == 3:
-                    patch_tokens_projected = self.proj_feat_dim3(patch_tokens)
-                del patch_tokens
-
-                batch_size, feat_dim, im_num, token_num = patch_tokens_projected.shape
-                patch_tokens_projected = patch_tokens_projected.reshape(batch_size, feat_dim, -1)
-                patch_tokens_projected = patch_tokens_projected.permute(2, 0, 1).contiguous()
-                x.append(patch_tokens_projected)
-
-            if not self.if_use_pred_pc_query:
-                del vggt_token_list
-
-
+                raise ValueError(
+                    'VGGT-Omega must provide 4 cached feature layers, '
+                    f'got {len(cached_tokens)}')
         else:
-            tokens_last_layer = vggt_token_list[-1]
-            patch_tokens_last_layer = tokens_last_layer[:, :, ps_idx:, :]
-            x = patch_tokens_last_layer.permute(0, 3, 1, 2).contiguous()
-            x = self.proj_feat_dim(x)
-            batch_size, feat_dim, im_num, token_num = x.shape
-            x = x.reshape(batch_size, feat_dim, -1)
-            x = x.permute(2, 0, 1).contiguous()
+            cached_tokens = cached_tokens[-1:]
 
-        if self.if_use_pred_pc_query:
+        patch_size = self.vggt_encoder.aggregator.patch_size
+        patch_height = image_shape[0] // patch_size
+        patch_width = image_shape[1] // patch_size
+        feature_maps = []
+        for level, tokens in enumerate(cached_tokens):
+            patch_tokens = tokens[:, :, ps_idx:, :].permute(
+                0, 3, 1, 2).contiguous()
+            projector = getattr(self, f'proj_feat_dim{level}', None)
+            if projector is None:
+                projector = self.proj_feat_dim
+            projected = projector(patch_tokens)
+            batch_size, channels, num_views, num_tokens = projected.shape
+            if num_tokens != patch_height * patch_width:
+                raise ValueError(
+                    'VGGT patch tokens do not match the input image grid: '
+                    f'{num_tokens} != {patch_height} * {patch_width}')
+            feature_maps.append(
+                projected.permute(0, 2, 1, 3).reshape(
+                    batch_size, num_views, channels,
+                    patch_height, patch_width).contiguous())
+        return feature_maps
 
-            pred_pc, atten_weights = self.pred_pc_from_vggt(vggt_token_list, ps_idx, images, batch_inputs_dict,
-                                                            images_patch_attn)
-            if self.if_add_noises:
-                pred_pc = self.add_normalized_noise_to_point_cloud(pred_pc, self.noise_level)
-            if self.if_use_atten_fps:
-                query_xyz, query_embed = self.get_query_embeddings_atten_fps(pred_pc, point_cloud_dims=None,
-                                                                             atten_weights=atten_weights)
-            else:
-                query_xyz, query_embed = self.get_query_embeddings(pred_pc,
-                                                                   point_cloud_dims=None)  # query_xyz shape: [4, 256, 3], query_embed: [4, 1024, 256]
+    def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
+                         images, images_patch_attn):
+        if not self.if_use_pred_pc_query:
+            raise ValueError(
+                'Projected deformable attention requires VGGT point queries')
 
-            query_embed = query_embed.permute(2, 0, 1)  # query_embed: [256, 4, 1024]
-            tgt = torch.zeros((self.num_queries, batch_size, feat_dim), device=query_xyz.device)
-            ######### idea 2 ############
-            if self.if_task_query:
-                expanded_task_query = self.task_query.unsqueeze(1).expand(-1, batch_size, -1)
-                tgt = torch.cat([tgt, expanded_task_query], dim=0)  # [num_queries+1, bs, feat_dim]
-            ######### idea 2 ############
+        feature_maps = self._build_patch_feature_maps(
+            vggt_token_list, ps_idx, images.shape[-2:])
+        (pred_pc, atten_weights, predicted_first_w2c,
+         vggt_extrinsics, vggt_intrinsics) = self.pred_pc_from_vggt(
+             vggt_token_list, ps_idx, images, images_patch_attn)
+        batch_inputs_dict['predicted_first_w2c'] = predicted_first_w2c
+        batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
+        batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
 
-            box_features = self.decoder(tgt, x, query_pos=query_embed, pos=None, if_task_query=self.if_task_query)[0]
-            batch_inputs_dict['query_xyz'] = query_xyz
+        if self.if_add_noises:
+            pred_pc = self.add_normalized_noise_to_point_cloud(
+                pred_pc, self.noise_level)
+        if self.if_use_atten_fps:
+            query_xyz, _ = self.get_query_embeddings_atten_fps(
+                pred_pc, point_cloud_dims=None,
+                atten_weights=atten_weights)
         else:
-            tgt = self.queries.unsqueeze(1).expand(-1, batch_size, -1)  # [num_queries, batch_size, token_dim]
-            box_features = self.decoder(tgt, x, query_pos=None, pos=None)[0]
+            query_xyz, _ = self.get_query_embeddings(
+                pred_pc, point_cloud_dims=None)
 
-        return box_features
+        point_min = pred_pc.amin(dim=1)
+        point_max = pred_pc.amax(dim=1)
+        point_extent = (point_max - point_min).clamp_min(1e-3)
+        range_padding = point_extent * 0.05
+        reference_min = point_min - range_padding
+        reference_max = point_max + range_padding
+        reference_points = (
+            (query_xyz - reference_min[:, None]) /
+            (reference_max - reference_min)[:, None]).clamp(1e-5, 1 - 1e-5)
+
+        batch_inputs_dict['query_xyz'] = query_xyz
+        batch_inputs_dict['reference_min'] = reference_min
+        batch_inputs_dict['reference_max'] = reference_max
+        batch_size, num_queries = query_xyz.shape[:2]
+        query = torch.zeros(
+            batch_size, num_queries, feature_maps[0].shape[2],
+            device=query_xyz.device, dtype=feature_maps[0].dtype)
+        return self.decoder(
+            query,
+            feature_maps,
+            reference_points,
+            reference_min,
+            reference_max,
+            vggt_extrinsics,
+            vggt_intrinsics,
+            images.shape[-2:],
+            self.pos_embedding,
+            self.query_projection,
+            self.bbox_head.center_heads)
 
     def add_normalized_noise_to_point_cloud(self, pred_pc, noise_level):
 
@@ -492,11 +525,20 @@ class ReconDet(Base3DDetector):
 
         if self.if_mix_precision:
             with autocast(img.device):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+                box_features, refined_query_xyz = self.get_box_features(
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    images_patch_attn)
         else:
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+            box_features, refined_query_xyz = self.get_box_features(
+                vggt_token_list, ps_idx, batch_inputs_dict, img,
+                images_patch_attn)
 
-        losses = self.bbox_head.loss(box_features, batch_data_samples, batch_inputs_dict, **kwargs)
+        losses = self.bbox_head.loss(
+            box_features,
+            batch_data_samples,
+            batch_inputs_dict,
+            refined_query_xyz=refined_query_xyz,
+            **kwargs)
         return losses
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
@@ -507,14 +549,27 @@ class ReconDet(Base3DDetector):
 
         if self.if_mix_precision:
             with autocast(img.device):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+                box_features, refined_query_xyz = self.get_box_features(
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    images_patch_attn)
         else:
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+            box_features, refined_query_xyz = self.get_box_features(
+                vggt_token_list, ps_idx, batch_inputs_dict, img,
+                images_patch_attn)
 
+        layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
+            refined_query_xyz = [refined_query_xyz[-1]]
+            layer_ids = [layer_ids[-1]]
 
-        results_list = self.bbox_head.predict(box_features, batch_data_samples, batch_inputs_dict, **kwargs)
+        results_list = self.bbox_head.predict(
+            box_features,
+            batch_data_samples,
+            batch_inputs_dict,
+            refined_query_xyz=refined_query_xyz,
+            layer_ids=layer_ids,
+            **kwargs)
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
         return predictions
@@ -526,14 +581,22 @@ class ReconDet(Base3DDetector):
 
         if self.if_mix_precision:
             with autocast(img.device):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+                box_features, refined_query_xyz = self.get_box_features(
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    images_patch_attn)
         else:
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+            box_features, refined_query_xyz = self.get_box_features(
+                vggt_token_list, ps_idx, batch_inputs_dict, img,
+                images_patch_attn)
 
+        layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
+            refined_query_xyz = [refined_query_xyz[-1]]
+            layer_ids = [layer_ids[-1]]
 
-        results = self.bbox_head.forward(box_features, batch_inputs_dict)
+        results = self.bbox_head.forward(
+            box_features, batch_inputs_dict, refined_query_xyz, layer_ids)
         return results
 
     def get_query_embeddings(self, encoder_xyz, point_cloud_dims):
@@ -618,22 +681,3 @@ class ReconDet(Base3DDetector):
                     print(f"Step {k}: Mem {mem:.2f}GB | Min Dist {min_dists.min().item():.4f}")
 
         return indices
-
-
-def build_decoder(args, if_multilevel=False):
-    decoder_layer = TransformerDecoderLayer(
-        d_model=args.dec_dim,
-        nhead=args.dec_nhead,
-        dim_feedforward=args.dec_ffn_dim,
-        dropout=args.dec_dropout,
-    )
-
-    if if_multilevel:
-        decoder = TransformerDecoder_Multilevel(
-            decoder_layer, num_layers=args.dec_nlayers, return_intermediate=True
-        )
-    else:
-        decoder = TransformerDecoder(
-            decoder_layer, num_layers=args.dec_nlayers, return_intermediate=True
-        )
-    return decoder

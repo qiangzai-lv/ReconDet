@@ -1,11 +1,11 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import copy
 from functools import partial
 from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
 from mmcv.cnn import Scale
-from mmdet.models.utils import multi_apply
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 from torch import Tensor, nn
@@ -56,10 +56,10 @@ class ReconDetHead(BaseModule):
                                'not_objness_loss': 0.25},
                  learn_center_diff=False,
                  if_v2_head=False,
-                 if_project_frist_frame_back=False,
                  matcher='one2one',
                  matcher_iou_thres=0.25,
-                 matcher_max_dynamic_samples=10
+                 matcher_max_dynamic_samples=10,
+                 loss_layer_ids=None,
                  ):
         super(ReconDetHead, self).__init__(init_cfg)
         self.n_classes = n_classes
@@ -103,64 +103,125 @@ class ReconDetHead(BaseModule):
                                                      matcher_max_dynamic_samples=matcher_max_dynamic_samples)
         self.loss_weights = loss_weights
         self.learn_center_diff = learn_center_diff
-        self.if_project_frist_frame_back = if_project_frist_frame_back
+        if loss_layer_ids is None:
+            loss_layer_ids = list(range(n_levels))
+        self.loss_layer_ids = sorted(set(loss_layer_ids))
+        if not self.loss_layer_ids:
+            raise ValueError('loss_layer_ids must contain at least one layer')
+        if self.loss_layer_ids[0] < 0 or self.loss_layer_ids[-1] >= n_levels:
+            raise ValueError(
+                f'loss_layer_ids must be within [0, {n_levels - 1}]')
 
     def _init_layers(self, n_channels, n_reg_outs, n_classes, n_levels):
-        self.center_head = self.mlp_func(output_dim=3)
-        self.size_head = self.mlp_func(output_dim=3)
-        self.semcls_head = self.mlp_func(output_dim=n_classes + 1)  # foreground categories
+        center_head = self.mlp_func(output_dim=3)
+        size_head = self.mlp_func(output_dim=3)
+        semcls_head = self.mlp_func(output_dim=n_classes + 1)
+        self.center_heads = nn.ModuleList([
+            copy.deepcopy(center_head) for _ in range(n_levels)
+        ])
+        self.size_heads = nn.ModuleList([
+            copy.deepcopy(size_head) for _ in range(n_levels)
+        ])
+        self.semcls_heads = nn.ModuleList([
+            copy.deepcopy(semcls_head) for _ in range(n_levels)
+        ])
+        for center_head in self.center_heads:
+            nn.init.constant_(center_head.layers[-1].weight, 0.)
+            nn.init.constant_(center_head.layers[-1].bias, 0.)
         self.scales = nn.ModuleList([Scale(1.) for _ in range(n_levels)])
 
-    def project_the_first_frame_back(self, x: Tensor, pose_matrix, axis_align_matrix):
-        batch_size, _, num_boxes = x.shape
-        pose_matrix = torch.stack(pose_matrix, dim=0).to(x.device, dtype=x.dtype)  # [16, 4, 4]
-        axis_align_matrix = torch.stack(axis_align_matrix, dim=0).to(x.device, dtype=x.dtype)
-        ones = torch.ones(batch_size, 1, num_boxes, device=x.device)  # [16, 1, 256]
-        x_homogeneous = torch.cat([x, ones], dim=1)  # [16, 4, 256]
+    def forward(self, x, batch_inputs_dict, refined_query_xyz=None,
+                layer_ids=None):
+        if layer_ids is None:
+            layer_ids = list(range(len(x)))
+        if len(layer_ids) != len(x):
+            raise ValueError('Layer ids must match decoder outputs')
+        if refined_query_xyz is None or len(refined_query_xyz) != len(x):
+            raise ValueError('Refined references must match decoder outputs')
 
-        x_global_homogeneous = torch.bmm(pose_matrix, x_homogeneous)  # [16, 4, 256]
-        x_global_homogeneous = torch.bmm(axis_align_matrix, x_global_homogeneous)
-        w = torch.clamp(x_global_homogeneous[:, 3:4, :], min=1e-8)
-        x_global = x_global_homogeneous[:, :3, :] / w
-        return x_global
+        center_preds = []
+        size_preds = []
+        cls_preds = []
+        for feature, center, layer_id in zip(
+                x, refined_query_xyz, layer_ids):
+            center_preds.append(center.permute(0, 2, 1))
+            size_preds.append(torch.exp(
+                self.scales[layer_id](self.size_heads[layer_id](feature))))
+            cls_preds.append(self.semcls_heads[layer_id](feature))
+        return center_preds, size_preds, cls_preds
 
-    def _forward_single(self, x: Tensor, scale: Scale, query_xyz, pose_matrix, axis_align_matrix, avg_distance):
-
-        if self.learn_center_diff:
-            query_xyz = query_xyz.permute(0, 2, 1)
-            if self.if_project_frist_frame_back:
-                center_pred = self.project_the_first_frame_back(self.center_head(x) + query_xyz, pose_matrix,
-                                                                axis_align_matrix)
-            else:
-                center_pred = self.center_head(x) + query_xyz
-
+    @staticmethod
+    def _batch_tensor(value, reference):
+        if isinstance(value, torch.Tensor):
+            tensor = value
+        elif isinstance(value, (int, float)):
+            tensor = torch.as_tensor([value])
         else:
-            if self.if_project_frist_frame_back:
-                center_pred = self.project_the_first_frame_back(self.center_head(x), pose_matrix, axis_align_matrix)
-            else:
-                center_pred = self.center_head(x)
+            tensor = torch.stack([
+                item if isinstance(item, torch.Tensor) else torch.as_tensor(item)
+                for item in value
+            ], dim=0)
+        return tensor.to(device=reference.device, dtype=torch.float32)
 
-        return (center_pred, torch.exp(scale(self.size_head(x))),  # / avg_distance_tensor,
-                self.semcls_head(x))  # , self.objness_head(x)
+    def _transform_bbox_predictions(self, center_preds, size_preds,
+                                    batch_inputs_dict):
+        reference = center_preds[0]
+        pose_matrix = self._batch_tensor(
+            batch_inputs_dict['pose_matrix'], reference)
+        axis_align_matrix = self._batch_tensor(
+            batch_inputs_dict['axis_align_matrix'], reference)
+        predicted_first_w2c = self._batch_tensor(
+            batch_inputs_dict['predicted_first_w2c'], reference)
+        scene_scale = self._batch_tensor(
+            batch_inputs_dict['scene_scale'], reference).reshape(
+                reference.shape[0], 1, 1)
 
-    def forward(self, x, batch_inputs_dict, batch_data_samples):
-        if 'query_xyz' in batch_inputs_dict.keys():
-            return multi_apply(self._forward_single, x, self.scales,
-                               [batch_inputs_dict['query_xyz'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['pose_matrix'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['axis_align_matrix'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['avg_distance'] for _ in range(self.n_levels)])
-        else:
-            return multi_apply(self._forward_single, x, self.scales, [None for _ in range(self.n_levels)],
-                               [batch_inputs_dict['pose_matrix'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['axis_align_matrix'] for _ in range(self.n_levels)],
-                               [batch_inputs_dict['avg_distance'] for _ in range(self.n_levels)])
+        if pose_matrix.shape[-2:] != (4, 4):
+            raise ValueError('pose_matrix must have shape [B, 4, 4]')
+        if axis_align_matrix.shape[-2:] != (4, 4):
+            raise ValueError('axis_align_matrix must have shape [B, 4, 4]')
+        if predicted_first_w2c.shape[-2:] == (3, 4):
+            bottom_row = predicted_first_w2c.new_zeros(
+                predicted_first_w2c.shape[0], 1, 4)
+            bottom_row[..., 0, 3] = 1
+            predicted_first_w2c = torch.cat(
+                [predicted_first_w2c, bottom_row], dim=1)
+        if predicted_first_w2c.shape[-2:] != (4, 4):
+            raise ValueError(
+                'predicted_first_w2c must have shape [B, 3, 4] or [B, 4, 4]')
 
-    def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList, batch_inputs_dict: dict,
-             **kwargs) -> dict:
+        transform = torch.bmm(
+            axis_align_matrix,
+            torch.bmm(pose_matrix, predicted_first_w2c))
+        transformed_centers = []
+        transformed_sizes = []
+        for centers, sizes in zip(center_preds, size_preds):
+            scaled_centers = centers.float() * scene_scale
+            ones = scaled_centers.new_ones(
+                scaled_centers.shape[0], 1, scaled_centers.shape[2])
+            homogeneous_centers = torch.cat([scaled_centers, ones], dim=1)
+            aligned_centers = torch.bmm(
+                transform, homogeneous_centers)[:, :3, :]
+            transformed_centers.append(aligned_centers)
+            transformed_sizes.append(sizes.float() * scene_scale)
+        return transformed_centers, transformed_sizes
 
-        outs = self(x, batch_inputs_dict,
-                    batch_data_samples)  # x len: 8, every tensor shape: [bs, feat_dim, num_queries]
+    def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
+             batch_inputs_dict: dict, refined_query_xyz=None, **kwargs) -> dict:
+        if refined_query_xyz is None or len(refined_query_xyz) != len(x):
+            raise ValueError('Loss requires one refined reference per layer')
+        layer_ids = self.loss_layer_ids
+        supervised_features = [x[layer_id] for layer_id in layer_ids]
+        supervised_references = [
+            refined_query_xyz[layer_id] for layer_id in layer_ids
+        ]
+        center_preds, size_preds, cls_preds = self(
+            supervised_features,
+            batch_inputs_dict,
+            supervised_references,
+            layer_ids)
+        center_preds, size_preds = self._transform_bbox_predictions(
+            center_preds, size_preds, batch_inputs_dict)
 
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -176,8 +237,9 @@ class ReconDetHead(BaseModule):
             batch_gt_instances_ignore.append(
                 data_sample.get('ignored_instances', None))
 
-        loss_inputs = outs + (batch_gt_instances_3d,
-                              batch_input_metas, batch_input_points, batch_gt_instances_ignore)
+        loss_inputs = (center_preds, size_preds, cls_preds, layer_ids,
+                       batch_gt_instances_3d, batch_input_metas,
+                       batch_input_points, batch_gt_instances_ignore)
         losses = self.loss_by_feat(*loss_inputs)
         return losses
 
@@ -185,6 +247,7 @@ class ReconDetHead(BaseModule):
                      center_preds: List[List[Tensor]],
                      size_preds: List[List[Tensor]],
                      cls_preds: List[List[Tensor]],
+                     layer_ids: List[int],
                      #  objness_preds: List[List[Tensor]],
                      batch_gt_instances_3d: InstanceList,
                      batch_input_metas: List[dict],
@@ -192,27 +255,44 @@ class ReconDetHead(BaseModule):
                      batch_gt_instances_ignore: OptInstanceList = None,
                      **kwargs) -> dict:
 
-        center_losses, size_losses, cls_losses, objness_losses, giou_losses = [], [], [], [], []
-        for i in range(len(batch_input_metas)):
-            center_loss, size_loss, cls_loss, giou_loss = self._loss_by_feat_single(
-                center_preds=[x[i] for x in center_preds],
-                size_preds=[x[i] for x in size_preds],
-                cls_preds=[x[i] for x in cls_preds],
-                input_meta=batch_input_metas[i],
-                gt_bboxes=batch_gt_instances_3d[i].bboxes_3d,
-                gt_labels=batch_gt_instances_3d[i].labels_3d,
-                input_points=batch_input_points[i])
-            center_losses.append(center_loss)
-            size_losses.append(size_loss)
-            cls_losses.append(cls_loss)
-            giou_losses.append(giou_loss)
+        if len(layer_ids) != len(center_preds):
+            raise ValueError('Layer ids must match supervised predictions')
 
-        return dict(
-            center_loss=torch.mean(torch.stack(center_losses)),
-            size_loss=torch.mean(torch.stack(size_losses)),
-            cls_loss=torch.mean(torch.stack(cls_losses)),
-            giou_loss=torch.mean(torch.stack(giou_losses))
-        )
+        losses_by_layer = []
+        for prediction_id, layer_id in enumerate(layer_ids):
+            center_losses = []
+            size_losses = []
+            cls_losses = []
+            giou_losses = []
+            for batch_id in range(len(batch_input_metas)):
+                center_loss, size_loss, cls_loss, giou_loss = \
+                    self._loss_by_feat_single(
+                        center_preds=[center_preds[prediction_id][batch_id]],
+                        size_preds=[size_preds[prediction_id][batch_id]],
+                        cls_preds=[cls_preds[prediction_id][batch_id]],
+                        input_meta=batch_input_metas[batch_id],
+                        gt_bboxes=batch_gt_instances_3d[
+                            batch_id].bboxes_3d,
+                        gt_labels=batch_gt_instances_3d[
+                            batch_id].labels_3d,
+                        input_points=batch_input_points[batch_id])
+                center_losses.append(center_loss)
+                size_losses.append(size_loss)
+                cls_losses.append(cls_loss)
+                giou_losses.append(giou_loss)
+            losses_by_layer.append((layer_id, dict(
+                center_loss=torch.mean(torch.stack(center_losses)),
+                size_loss=torch.mean(torch.stack(size_losses)),
+                cls_loss=torch.mean(torch.stack(cls_losses)),
+                giou_loss=torch.mean(torch.stack(giou_losses)))))
+
+        loss_dict = {}
+        main_layer_id = layer_ids[-1]
+        for layer_id, layer_losses in losses_by_layer:
+            prefix = '' if layer_id == main_layer_id else f'd{layer_id}.'
+            for name, value in layer_losses.items():
+                loss_dict[f'{prefix}{name}'] = value
+        return loss_dict
 
     def _loss_by_feat_single(self, center_preds, size_preds, cls_preds,  # objness_preds,
                              input_meta, gt_bboxes, gt_labels, input_points):
@@ -267,14 +347,18 @@ class ReconDetHead(BaseModule):
     def predict(self,
                 x: Tuple[Tensor],
                 batch_data_samples: SampleList, batch_inputs_dict,
+                refined_query_xyz=None, layer_ids=None,
                 rescale: bool = False) -> InstanceList:
 
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        outs = self(x, batch_inputs_dict, batch_data_samples)
+        center_preds, size_preds, cls_preds = self(
+            x, batch_inputs_dict, refined_query_xyz, layer_ids)
+        center_preds, size_preds = self._transform_bbox_predictions(
+            center_preds, size_preds, batch_inputs_dict)
         predictions = self.predict_by_feat(
-            *outs,
+            center_preds, size_preds, cls_preds,
             batch_input_metas=batch_input_metas,
             rescale=rescale, batch_inputs_dict=batch_inputs_dict, batch_data_samples=batch_data_samples)
         return predictions
