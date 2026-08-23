@@ -60,6 +60,7 @@ class ReconDetHead(BaseModule):
                  matcher_iou_thres=0.25,
                  matcher_max_dynamic_samples=10,
                  loss_layer_ids=None,
+                 size_logit_range=(-10.0, 10.0),
                  ):
         super(ReconDetHead, self).__init__(init_cfg)
         self.n_classes = n_classes
@@ -103,6 +104,9 @@ class ReconDetHead(BaseModule):
                                                      matcher_max_dynamic_samples=matcher_max_dynamic_samples)
         self.loss_weights = loss_weights
         self.learn_center_diff = learn_center_diff
+        if len(size_logit_range) != 2 or size_logit_range[0] >= size_logit_range[1]:
+            raise ValueError('size_logit_range must be an increasing pair')
+        self.size_logit_range = tuple(float(value) for value in size_logit_range)
         if loss_layer_ids is None:
             loss_layer_ids = list(range(n_levels))
         self.loss_layer_ids = sorted(set(loss_layer_ids))
@@ -145,8 +149,19 @@ class ReconDetHead(BaseModule):
         for feature, center, layer_id in zip(
                 x, refined_query_xyz, layer_ids):
             center_preds.append(center.permute(0, 2, 1))
-            size_preds.append(torch.exp(
-                self.scales[layer_id](self.size_heads[layer_id](feature))))
+            size_logits = self.scales[layer_id](
+                self.size_heads[layer_id](feature))
+            with torch.autocast(device_type=size_logits.device.type,
+                                enabled=False):
+                size_logits = size_logits.float()
+                bounded_logits = size_logits.clamp(
+                    min=self.size_logit_range[0],
+                    max=self.size_logit_range[1])
+                # Bound the exponential in forward while retaining recovery
+                # gradients for logits that have crossed the stable range.
+                bounded_logits = size_logits + (
+                    bounded_logits - size_logits).detach()
+                size_preds.append(torch.exp(bounded_logits))
             cls_preds.append(self.semcls_heads[layer_id](feature))
         return center_preds, size_preds, cls_preds
 

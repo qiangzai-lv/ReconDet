@@ -64,7 +64,8 @@ model = dict(
         matcher='one2more',
         matcher_iou_thres=0.1,
         matcher_max_dynamic_samples=5,
-        loss_layer_ids=list(range(_decoder_layer_num))
+        loss_layer_ids=list(range(_decoder_layer_num)),
+        size_logit_range=(-10.0, 10.0)
     ),
     num_queries=900,
     token_dim=_token_dim_,
@@ -73,10 +74,6 @@ model = dict(
     use_multi_layers=True,
     if_simpler_project=True,
     if_use_pred_pc_query=True,
-    if_use_atten_sample=False,
-    atten_sample_ratio=10,
-    if_use_atten_fps=True,
-    lambda_dist=0.8,
     if_task_query=False,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)

@@ -2,7 +2,6 @@ from typing import List, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from mmcv.ops import furthest_point_sample
 
 from mmdet3d.models.detectors import Base3DDetector
@@ -11,7 +10,7 @@ from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
-from recondet.device import autocast, get_device, get_amp_dtype
+from recondet.device import autocast, get_device
 from recondet.geometry_attention import GeometryAwareDeformableDecoder
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.geometry import unproject_depth_map_to_point_map_torch
@@ -78,11 +77,7 @@ class ReconDet(Base3DDetector):
             use_multi_layers=False,
             if_simpler_project=False,
             if_use_pred_pc_query=False,
-            if_use_atten_sample=False,
-            atten_sample_ratio=10,
             depth_thres=1000,
-            if_use_atten_fps=False,
-            lambda_dist=1.0,
             if_task_query=False,
             if_add_noises=False,
             noise_level=None,
@@ -193,11 +188,7 @@ class ReconDet(Base3DDetector):
         self.if_save_vggt_feature = if_save_vggt_feature
 
         self.use_multi_layers = use_multi_layers
-        self.if_use_atten_sample = if_use_atten_sample
-        self.atten_sample_ratio = atten_sample_ratio
         self.depth_thres = depth_thres
-        self.if_use_atten_fps = if_use_atten_fps
-        self.lambda_dist = lambda_dist
         self.if_add_noises = if_add_noises
         self.noise_level = noise_level
 
@@ -216,18 +207,12 @@ class ReconDet(Base3DDetector):
             # normalization. VGGT-Omega expects RGB values in [0, 1].
             img = batch_inputs_dict['imgs'].float().div(255.0)
             with autocast(img.device):
-                if self.if_use_atten_sample or self.if_use_atten_fps:
-                    aggregated_tokens_list, ps_idx, images_patch_attn = self.vggt_encoder.aggregator(
-                        img,
-                        return_patch_attention=True,
-                    )
-                    return aggregated_tokens_list, ps_idx, img, images_patch_attn
-                else:
-                    aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(img)
-                    return aggregated_tokens_list, ps_idx, img, None
+                aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(
+                    img)
+                return aggregated_tokens_list, ps_idx, img
 
     @torch.no_grad()
-    def batch_random_sample(self, points, k=100000, depth_mask=None, weights=None):
+    def batch_random_sample(self, points, k=100000, depth_mask=None):
         B, N, _ = points.shape
         device = points.device
 
@@ -241,14 +226,10 @@ class ReconDet(Base3DDetector):
 
         batch_indices = torch.arange(B, device=device)[:, None]
 
-        if weights is not None:
-            return points[batch_indices, indices], weights[batch_indices, indices]
-        else:
-            return points[batch_indices, indices]
+        return points[batch_indices, indices]
 
     @torch.no_grad()
-    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images,
-                          images_patch_attn):
+    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images):
 
         with torch.no_grad():
             with autocast(images.device):
@@ -277,137 +258,28 @@ class ReconDet(Base3DDetector):
                 assert depth_map.shape[-1] == 1
                 depth_map = depth_map.squeeze(-1)
 
-                if self.if_use_atten_sample:
-                    images_patch_attn = images_patch_attn.float()
-
-                    point_map_by_unprojection_tensor = unproject_depth_map_to_point_map_torch(depth_map, extrinsic,
-                                                                                              intrinsic)
-                    point_map_by_unprojection_tensor = point_map_by_unprojection_tensor.reshape(
-                        point_map_by_unprojection_tensor.shape[0], point_map_by_unprojection_tensor.shape[1], -1,
-                        point_map_by_unprojection_tensor.shape[-1])  # shape:(bs, view_num,  h * w, 3)
-
-                    bs, num_frame, h, w = depth_map.shape
-
-                    # # use depth 
-                    depth_mask = depth_map > self.depth_thres  # shape [10, 40, 336, 448]
-                    patch_size = self.vggt_encoder.aggregator.patch_size
-                    attn_reshape = images_patch_attn.view(bs, num_frame, h // patch_size, w // patch_size)
-
-                    attn_img_up = F.interpolate(attn_reshape,
-                                                size=(h, w),  # (H, W)
-                                                mode='bicubic',
-                                                align_corners=False)
-
-                    attn_img_up = attn_img_up.view(bs * num_frame, -1)  # (bs*num_frame, h*w)
-
-                    min_val = torch.min(attn_img_up, -1, keepdim=True).values  # (bs*num_frame, 1)
-                    max_val = torch.max(attn_img_up, -1, keepdim=True).values  # (bs*num_frame, 1)
-
-                    denominator = max_val - min_val
-                    norm_attn_img_up = torch.where(  # (bs*num_frame, h*w)
-                        denominator != 0,
-                        (attn_img_up - min_val) / denominator,
-                        torch.tensor(1.0, device=attn_img_up.device)
-                    )
-                    attn_depth_mask = depth_mask.view(bs * num_frame, -1)
-                    norm_attn_img_up[attn_depth_mask] = 0.0  # (bs*num_frame, h*w)
-                    prob_dist_pre = norm_attn_img_up
-                    num_point = prob_dist_pre.shape[-1]  # (bs*num_frame, h*w)
-                    prob_dist = prob_dist_pre / prob_dist_pre.sum(dim=-1, keepdim=True)
-                    num_samples = int(num_point / self.atten_sample_ratio)
-
-                    # sampled_indices = torch.multinomial(prob_dist, num_samples, replacement=False)
-
-                    topk_values, sampled_indices = torch.topk(prob_dist, num_samples, dim=1)
-
-                    sampled_indices = sampled_indices.view(bs, num_frame, num_samples)
-                    expanded_indices = sampled_indices.unsqueeze(-1).expand(-1, -1, -1, 3)
-
-                    del norm_attn_img_up, attn_img_up, attn_reshape, prob_dist_pre, prob_dist
-                    sampled_point_map_by_unprojection_tensor = torch.gather(point_map_by_unprojection_tensor, dim=2,
-                                                                            index=expanded_indices)
-                    sampled_point_map_by_unprojection_tensor = sampled_point_map_by_unprojection_tensor.reshape(
-                        sampled_point_map_by_unprojection_tensor.shape[0], -1,
-                        sampled_point_map_by_unprojection_tensor.shape[-1])
-                    # print(1)
-                    sampled_point_map_by_unprojection_tensor = self.batch_random_sample(
-                        sampled_point_map_by_unprojection_tensor, 100000)
-
-                    del depth_map, depth_conf, pose_enc
-
-                elif self.if_use_atten_fps:
-                    images_patch_attn = images_patch_attn.float()
-
-                    point_map_by_unprojection_tensor = unproject_depth_map_to_point_map_torch(depth_map, extrinsic,
-                                                                                              intrinsic)
-                    point_map_by_unprojection_tensor = point_map_by_unprojection_tensor.reshape(
+                point_map_by_unprojection_tensor = \
+                    unproject_depth_map_to_point_map_torch(
+                        depth_map, extrinsic, intrinsic)
+                point_map_by_unprojection_tensor = \
+                    point_map_by_unprojection_tensor.reshape(
                         point_map_by_unprojection_tensor.shape[0], -1,
-                        point_map_by_unprojection_tensor.shape[-1])  # shape:(bs, view_num,  h * w, 3)
+                        point_map_by_unprojection_tensor.shape[-1])
+                depth_mask = depth_map > self.depth_thres
+                depth_mask = depth_mask.reshape(
+                    point_map_by_unprojection_tensor.shape[0], -1)
 
-                    bs, num_frame, h, w = depth_map.shape
+                del depth_map, depth_conf, pose_enc
 
-                    # # use depth 
-                    depth_mask = depth_map > self.depth_thres  # shape [10, 40, 336, 448]
-
-                    patch_size = self.vggt_encoder.aggregator.patch_size
-
-                    attn_reshape = images_patch_attn.view(bs, num_frame, h // patch_size, w // patch_size)
-
-                    attn_img_up = F.interpolate(attn_reshape,
-                                                size=(h, w),  # (H, W)
-                                                mode='bicubic',
-                                                align_corners=False)
-
-                    attn_img_up = attn_img_up.view(bs, -1)  # (bs, h*w*num_frame)
-
-                    min_val = torch.min(attn_img_up, -1, keepdim=True).values  # (bs*num_frame, 1)
-                    max_val = torch.max(attn_img_up, -1, keepdim=True).values  # (bs*num_frame, 1)
-
-                    denominator = max_val - min_val
-                    norm_attn_img_up = torch.where(  # (bs*num_frame, h*w)
-                        denominator != 0,
-                        (attn_img_up - min_val) / denominator,
-                        torch.tensor(1.0, device=attn_img_up.device)
-                    )
-                    attn_depth_mask = depth_mask.view(bs, -1)
-                    norm_attn_img_up[attn_depth_mask] = 0.0  # (bs*num_frame, h*w)
-                    prob_dist_pre = norm_attn_img_up
-                    num_point = prob_dist_pre.shape[-1]  # (bs*num_frame, h*w)
-                    prob_dist = prob_dist_pre / prob_dist_pre.sum(dim=-1, keepdim=True)
-                    # num_samples = int(num_point / self.atten_sample_ratio)
-
-                    prob_dist = prob_dist.view(bs, -1)
-
-                    del norm_attn_img_up, attn_img_up, attn_reshape, prob_dist_pre
-
-                    sampled_point_map_by_unprojection_tensor, atten_weights = self.batch_random_sample(
-                        point_map_by_unprojection_tensor, 100000, weights=prob_dist)
-
-                    del depth_map, depth_conf, pose_enc, prob_dist
-
-                else:
-                    point_map_by_unprojection_tensor = unproject_depth_map_to_point_map_torch(depth_map, extrinsic,
-                                                                                              intrinsic)
-                    point_map_by_unprojection_tensor = point_map_by_unprojection_tensor.reshape(
-                        point_map_by_unprojection_tensor.shape[0], -1, point_map_by_unprojection_tensor.shape[-1])
-                    depth_mask = depth_map > self.depth_thres
-                    depth_mask = depth_mask.reshape(point_map_by_unprojection_tensor.shape[0], -1)
-
-                    del depth_map, depth_conf, pose_enc
-
-                    sampled_point_map_by_unprojection_tensor = self.batch_random_sample(
+                sampled_point_map_by_unprojection_tensor = \
+                    self.batch_random_sample(
                         point_map_by_unprojection_tensor, 100000, depth_mask)
 
                 del point_map_by_unprojection_tensor
 
-                if self.if_use_atten_fps:
-                    return (sampled_point_map_by_unprojection_tensor.detach(),
-                            atten_weights, predicted_first_w2c,
-                            extrinsic.detach(), intrinsic.detach())
-                else:
-                    return (sampled_point_map_by_unprojection_tensor.detach(),
-                            None, predicted_first_w2c,
-                            extrinsic.detach(), intrinsic.detach())
+                return (sampled_point_map_by_unprojection_tensor.detach(),
+                        predicted_first_w2c, extrinsic.detach(),
+                        intrinsic.detach())
 
     def _build_patch_feature_maps(self, vggt_token_list, ps_idx,
                                   image_shape):
@@ -445,16 +317,16 @@ class ReconDet(Base3DDetector):
         return feature_maps
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
-                         images, images_patch_attn):
+                         images):
         if not self.if_use_pred_pc_query:
             raise ValueError(
                 'Projected deformable attention requires VGGT point queries')
 
         feature_maps = self._build_patch_feature_maps(
             vggt_token_list, ps_idx, images.shape[-2:])
-        (pred_pc, atten_weights, predicted_first_w2c,
-         vggt_extrinsics, vggt_intrinsics) = self.pred_pc_from_vggt(
-             vggt_token_list, ps_idx, images, images_patch_attn)
+        (pred_pc, predicted_first_w2c, vggt_extrinsics,
+         vggt_intrinsics) = self.pred_pc_from_vggt(
+             vggt_token_list, ps_idx, images)
         batch_inputs_dict['predicted_first_w2c'] = predicted_first_w2c
         batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
         batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
@@ -462,13 +334,8 @@ class ReconDet(Base3DDetector):
         if self.if_add_noises:
             pred_pc = self.add_normalized_noise_to_point_cloud(
                 pred_pc, self.noise_level)
-        if self.if_use_atten_fps:
-            query_xyz, _ = self.get_query_embeddings_atten_fps(
-                pred_pc, point_cloud_dims=None,
-                atten_weights=atten_weights)
-        else:
-            query_xyz, _ = self.get_query_embeddings(
-                pred_pc, point_cloud_dims=None)
+        query_xyz, _ = self.get_query_embeddings(
+            pred_pc, point_cloud_dims=None)
 
         point_min = pred_pc.amin(dim=1)
         point_max = pred_pc.amax(dim=1)
@@ -520,18 +387,16 @@ class ReconDet(Base3DDetector):
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
 
-        vggt_token_list, ps_idx, img, images_patch_attn = self.extract_feat(batch_inputs_dict, batch_data_samples,
-                                                                            'train')
+        vggt_token_list, ps_idx, img = self.extract_feat(
+            batch_inputs_dict, batch_data_samples, 'train')
 
         if self.if_mix_precision:
             with autocast(img.device):
                 box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    images_patch_attn)
+                    vggt_token_list, ps_idx, batch_inputs_dict, img)
         else:
             box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img,
-                images_patch_attn)
+                vggt_token_list, ps_idx, batch_inputs_dict, img)
 
         losses = self.bbox_head.loss(
             box_features,
@@ -544,18 +409,16 @@ class ReconDet(Base3DDetector):
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:
 
-        vggt_token_list, ps_idx, img, images_patch_attn = self.extract_feat(batch_inputs_dict, batch_data_samples,
-                                                                            'train')
+        vggt_token_list, ps_idx, img = self.extract_feat(
+            batch_inputs_dict, batch_data_samples, 'train')
 
         if self.if_mix_precision:
             with autocast(img.device):
                 box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    images_patch_attn)
+                    vggt_token_list, ps_idx, batch_inputs_dict, img)
         else:
             box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img,
-                images_patch_attn)
+                vggt_token_list, ps_idx, batch_inputs_dict, img)
 
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
@@ -576,18 +439,16 @@ class ReconDet(Base3DDetector):
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                  *args, **kwargs) -> Tuple[List[torch.Tensor]]:
-        vggt_token_list, ps_idx, img, images_patch_attn = self.extract_feat(batch_inputs_dict, batch_data_samples,
-                                                                            'train')
+        vggt_token_list, ps_idx, img = self.extract_feat(
+            batch_inputs_dict, batch_data_samples, 'train')
 
         if self.if_mix_precision:
             with autocast(img.device):
                 box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    images_patch_attn)
+                    vggt_token_list, ps_idx, batch_inputs_dict, img)
         else:
             box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img,
-                images_patch_attn)
+                vggt_token_list, ps_idx, batch_inputs_dict, img)
 
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
@@ -600,7 +461,8 @@ class ReconDet(Base3DDetector):
         return results
 
     def get_query_embeddings(self, encoder_xyz, point_cloud_dims):
-        query_inds = furthest_point_sample(encoder_xyz, self.num_queries)
+        query_inds = furthest_point_sample(
+            encoder_xyz.float().contiguous(), self.num_queries)
         query_inds = query_inds.long()
         query_xyz = [torch.gather(encoder_xyz[..., x], 1, query_inds) for x in range(3)]
         query_xyz = torch.stack(query_xyz)
@@ -608,76 +470,3 @@ class ReconDet(Base3DDetector):
         pos_embed = self.pos_embedding(query_xyz, input_range=point_cloud_dims)
         query_embed = self.query_projection(pos_embed)
         return query_xyz, query_embed
-
-    def get_query_embeddings_atten_fps(self, encoder_xyz, point_cloud_dims, atten_weights=None):
-        query_inds = self.attention_guided_prob_fps(encoder_xyz, atten_weights, self.num_queries,
-                                                    lambda_dist=self.lambda_dist)
-        query_inds = query_inds.long()
-        query_xyz = [torch.gather(encoder_xyz[..., x], 1, query_inds) for x in range(3)]
-        query_xyz = torch.stack(query_xyz)
-        query_xyz = query_xyz.permute(1, 2, 0)
-        pos_embed = self.pos_embedding(query_xyz, input_range=point_cloud_dims)
-        query_embed = self.query_projection(pos_embed)
-        return query_xyz, query_embed
-
-    @torch.no_grad()
-    def attention_guided_prob_fps(self,
-                                  points: torch.Tensor,
-                                  attention_weights: torch.Tensor,
-                                  num_samples: int,
-                                  lambda_dist: float = 0.1,
-                                  chunk_size: int = 16384,
-                                  use_amp: bool = True,
-                                  verbose: bool = False
-                                  ) -> torch.Tensor:
-
-        assert points.dim() == 3, "the shape of points should be [B, N, 3]"
-        assert attention_weights.shape == points.shape[:2], "the shape of attention_weights should be [B, N]"
-
-        with autocast(points.device, enabled=use_amp):
-            B, N, _ = points.shape
-            device = points.device
-            batch_idx = torch.arange(B, device=device)[:, None]
-
-            indices = torch.zeros((B, num_samples), dtype=torch.long, device=device)
-            mask = torch.ones(B, N, dtype=torch.bool, device=device)
-
-            weights_min = attention_weights.min(1, keepdim=True).values
-            weights_max = attention_weights.max(1, keepdim=True).values
-            weights_norm = (attention_weights - weights_min) / (weights_max - weights_min + 1e-8)
-            amp_dtype = get_amp_dtype(points.device)
-            weights_norm = weights_norm.to(amp_dtype)
-
-            first_idx = torch.argmax(weights_norm, dim=1)
-            indices[:, 0] = first_idx
-            mask[batch_idx, first_idx.unsqueeze(1)] = False
-
-            min_dists = torch.full((B, N), float('inf'), dtype=amp_dtype, device=device)
-
-            for k in range(1, num_samples):
-                current_point = points.gather(1, indices[:, k - 1].view(-1, 1, 1).expand(-1, -1, 3))
-                for i in range(0, N, chunk_size):
-                    chunk = points[:, i:i + chunk_size]
-                    dist_chunk = torch.norm(chunk - current_point, dim=-1)
-                    min_dists[:, i:i + chunk_size] = torch.min(
-                        min_dists[:, i:i + chunk_size],
-                        dist_chunk.to(amp_dtype)
-                    )
-
-                dist_min = min_dists.min(1, keepdim=True).values
-                dist_max = min_dists.max(1, keepdim=True).values
-                dists_norm = (min_dists - dist_min) / (dist_max - dist_min + 1e-8)
-
-                priority = weights_norm + lambda_dist * dists_norm
-                priority[~mask] = -torch.inf
-
-                next_idx = torch.argmax(priority, dim=1)
-                indices[:, k] = next_idx
-                mask[batch_idx, next_idx.unsqueeze(1)] = False
-
-                if verbose and k % 10 == 0:
-                    backend = getattr(torch, points.device.type, None)
-                    mem = backend.memory_allocated() / 1024 ** 3 if backend is not None else 0.0
-                    print(f"Step {k}: Mem {mem:.2f}GB | Min Dist {min_dists.min().item():.4f}")
-
-        return indices
