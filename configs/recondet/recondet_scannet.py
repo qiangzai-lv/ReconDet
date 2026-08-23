@@ -74,7 +74,6 @@ model = dict(
     use_multi_layers=True,
     if_simpler_project=True,
     if_use_pred_pc_query=True,
-    if_task_query=False,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
 )

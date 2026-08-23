@@ -2,7 +2,6 @@ from typing import List, Tuple, Union
 
 import torch
 import torch.nn as nn
-from mmcv.ops import furthest_point_sample
 
 from mmdet3d.models.detectors import Base3DDetector
 from mmdet3d.registry import MODELS
@@ -78,9 +77,6 @@ class ReconDet(Base3DDetector):
             if_simpler_project=False,
             if_use_pred_pc_query=False,
             depth_thres=1000,
-            if_task_query=False,
-            if_add_noises=False,
-            noise_level=None,
             vggt_omega_checkpoint=None,
             deformable_num_points=4,
     ):
@@ -163,11 +159,6 @@ class ReconDet(Base3DDetector):
 
         self.num_queries = num_queries
 
-        if if_task_query:
-            raise ValueError(
-                'task_query has no projectable 3D reference point and is not '
-                'supported by projected deformable attention')
-        self.if_task_query = False
         self.test_only_last_layer = test_only_last_layer
 
         self.if_use_pred_pc_query = if_use_pred_pc_query
@@ -189,8 +180,6 @@ class ReconDet(Base3DDetector):
 
         self.use_multi_layers = use_multi_layers
         self.depth_thres = depth_thres
-        self.if_add_noises = if_add_noises
-        self.noise_level = noise_level
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -331,9 +320,6 @@ class ReconDet(Base3DDetector):
         batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
         batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
 
-        if self.if_add_noises:
-            pred_pc = self.add_normalized_noise_to_point_cloud(
-                pred_pc, self.noise_level)
         query_xyz, _ = self.get_query_embeddings(
             pred_pc, point_cloud_dims=None)
 
@@ -366,23 +352,6 @@ class ReconDet(Base3DDetector):
             self.pos_embedding,
             self.query_projection,
             self.bbox_head.center_heads)
-
-    def add_normalized_noise_to_point_cloud(self, pred_pc, noise_level):
-
-        assert len(pred_pc.shape) == 3 and pred_pc.shape[2] == 3, "the shape of pred_pc should be [1, N, 3]"
-        assert 0.0 <= noise_level <= 1.0, "the noise_level must be in the range [0, 1]"
-
-        max_coords = torch.max(pred_pc, dim=1, keepdim=True)[0]  # [1, 1, 3]
-        min_coords = torch.min(pred_pc, dim=1, keepdim=True)[0]  # [1, 1, 3]
-        range_coords = max_coords - min_coords  # [1, 1, 3]
-
-        actual_std = range_coords * noise_level
-
-        noise = torch.randn_like(pred_pc) * actual_std
-
-        noisy_pc = pred_pc + noise
-
-        return noisy_pc
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
@@ -460,13 +429,36 @@ class ReconDet(Base3DDetector):
             box_features, batch_inputs_dict, refined_query_xyz, layer_ids)
         return results
 
+    @staticmethod
+    @torch.no_grad()
+    def _farthest_point_sample(points, num_samples):
+        if len(points) == 0:
+            return points.new_zeros((num_samples, 3))
+
+        sample_count = min(num_samples, len(points))
+        indices = torch.empty(
+            sample_count, dtype=torch.long, device=points.device)
+        min_distances = torch.full(
+            (len(points),), float('inf'), device=points.device)
+        current = points.square().sum(dim=-1).argmax()
+        for sample_index in range(sample_count):
+            indices[sample_index] = current
+            distances = (points - points[current]).square().sum(dim=-1)
+            min_distances = torch.minimum(min_distances, distances)
+            current = min_distances.argmax()
+        sampled_points = points[indices]
+        if sample_count < num_samples:
+            sampled_points = torch.cat([
+                sampled_points,
+                sampled_points[-1:].expand(num_samples - sample_count, -1)
+            ])
+        return sampled_points
+
     def get_query_embeddings(self, encoder_xyz, point_cloud_dims):
-        query_inds = furthest_point_sample(
-            encoder_xyz.float().contiguous(), self.num_queries)
-        query_inds = query_inds.long()
-        query_xyz = [torch.gather(encoder_xyz[..., x], 1, query_inds) for x in range(3)]
-        query_xyz = torch.stack(query_xyz)
-        query_xyz = query_xyz.permute(1, 2, 0)
+        query_xyz = torch.stack([
+            self._farthest_point_sample(points, self.num_queries)
+            for points in encoder_xyz
+        ])
         pos_embed = self.pos_embedding(query_xyz, input_range=point_cloud_dims)
         query_embed = self.query_projection(pos_embed)
         return query_xyz, query_embed
