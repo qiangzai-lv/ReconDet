@@ -3,7 +3,6 @@ from typing import List, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.ops import furthest_point_sample
 
 from mmdet3d.models.detectors import Base3DDetector
 from mmdet3d.registry import MODELS, TASK_UTILS
@@ -531,12 +530,36 @@ class ReconDet(Base3DDetector):
         results = self.bbox_head.forward(box_features, batch_inputs_dict)
         return results
 
+    @staticmethod
+    @torch.no_grad()
+    def _farthest_point_sample(points, num_samples):
+        if len(points) == 0:
+            return points.new_zeros((num_samples, 3))
+
+        sample_count = min(num_samples, len(points))
+        indices = torch.empty(
+            sample_count, dtype=torch.long, device=points.device)
+        min_distances = torch.full(
+            (len(points),), float('inf'), device=points.device)
+        current = points.square().sum(dim=-1).argmax()
+        for sample_index in range(sample_count):
+            indices[sample_index] = current
+            distances = (points - points[current]).square().sum(dim=-1)
+            min_distances = torch.minimum(min_distances, distances)
+            current = min_distances.argmax()
+        sampled_points = points[indices]
+        if sample_count < num_samples:
+            sampled_points = torch.cat([
+                sampled_points,
+                sampled_points[-1:].expand(num_samples - sample_count, -1)
+            ])
+        return sampled_points
+
     def get_query_embeddings(self, encoder_xyz, point_cloud_dims):
-        query_inds = furthest_point_sample(encoder_xyz, self.num_queries)
-        query_inds = query_inds.long()
-        query_xyz = [torch.gather(encoder_xyz[..., x], 1, query_inds) for x in range(3)]
-        query_xyz = torch.stack(query_xyz)
-        query_xyz = query_xyz.permute(1, 2, 0)
+        query_xyz = torch.stack([
+            self._farthest_point_sample(points, self.num_queries)
+            for points in encoder_xyz
+        ])
         pos_embed = self.pos_embedding(query_xyz, input_range=point_cloud_dims)
         query_embed = self.query_projection(pos_embed)
         return query_xyz, query_embed
