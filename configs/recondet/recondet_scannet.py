@@ -35,9 +35,6 @@ model = dict(
         dec_nlayers=_decoder_layer_num
     ),
     deformable_num_points=4,
-    reconstruction_vis_interval=10,
-    reconstruction_vis_dir='work_dirs/recondet_scannet/reconstruction_vis',
-    reconstruction_vis_max_points=100000,
     gt_points_dir=f'{data_root}/points',
     online_scale_point_stride=4,
     online_scale_max_depth=30.0,

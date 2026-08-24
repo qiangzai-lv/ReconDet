@@ -5,7 +5,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from mmengine.dist import is_main_process
 from mmdet3d.models.detectors import Base3DDetector
 from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
@@ -82,9 +81,6 @@ class ReconDet(Base3DDetector):
             depth_thres=1000,
             vggt_omega_checkpoint=None,
             deformable_num_points=4,
-            reconstruction_vis_interval=0,
-            reconstruction_vis_dir=None,
-            reconstruction_vis_max_points=100000,
             gt_points_dir=None,
             online_scale_point_stride=4,
             online_scale_max_depth=30.0,
@@ -189,29 +185,16 @@ class ReconDet(Base3DDetector):
 
         self.use_multi_layers = use_multi_layers
         self.depth_thres = depth_thres
-        if reconstruction_vis_interval < 0:
-            raise ValueError('reconstruction_vis_interval must be non-negative')
-        if reconstruction_vis_max_points <= 0:
-            raise ValueError('reconstruction_vis_max_points must be positive')
         if gt_points_dir is None:
             raise ValueError('Online scene scaling requires gt_points_dir')
         if online_scale_point_stride <= 0:
             raise ValueError('online_scale_point_stride must be positive')
         if online_scale_max_depth <= 1e-4:
             raise ValueError('online_scale_max_depth must be greater than 1e-4')
-        if reconstruction_vis_interval and reconstruction_vis_dir is None:
-            raise ValueError(
-                'Reconstruction visualization requires an output directory')
-        self.reconstruction_vis_interval = reconstruction_vis_interval
-        self.reconstruction_vis_dir = (
-            Path(reconstruction_vis_dir)
-            if reconstruction_vis_dir is not None else None)
-        self.reconstruction_vis_max_points = reconstruction_vis_max_points
         self.gt_points_dir = Path(gt_points_dir)
         self.online_scale_point_stride = online_scale_point_stride
         self.online_scale_max_depth = online_scale_max_depth
         self._gt_scene_diagonal_cache = {}
-        self._train_visualization_step = 0
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -313,13 +296,6 @@ class ReconDet(Base3DDetector):
         return aligned_points, aligned_extrinsics[..., :3, :]
 
     @staticmethod
-    def _limit_visualization_points(points, max_points):
-        if len(points) <= max_points:
-            return points
-        step = (len(points) + max_points - 1) // max_points
-        return points[::step][:max_points]
-
-    @staticmethod
     def _robust_scene_diagonal(points):
         lower, upper = np.quantile(points, [0.01, 0.99], axis=0)
         return float(np.linalg.norm(upper - lower))
@@ -381,67 +357,6 @@ class ReconDet(Base3DDetector):
                 raise ValueError(f'Invalid online scene scale: {scene_scale}')
             scales.append(scene_scale)
         return point_map.new_tensor(scales, dtype=torch.float32)
-
-    @staticmethod
-    def _coordinate_axis_points(points, num_points=512):
-        lower, upper = np.quantile(points, [0.01, 0.99], axis=0)
-        axis_length = max(float((upper - lower).max()) * 0.18, 0.1)
-        distance = np.linspace(
-            0.0, axis_length, num_points, dtype=np.float32)
-        axis_points = np.zeros((num_points * 3, 3), dtype=np.float32)
-        axis_colors = np.zeros_like(axis_points)
-        for axis_index in range(3):
-            start = axis_index * num_points
-            end = start + num_points
-            axis_points[start:end, axis_index] = distance
-            axis_colors[start:end, axis_index] = 1.0
-        return axis_points, axis_colors
-
-    @torch.no_grad()
-    def _save_reconstruction_visualization(
-            self, reconstructed_points, batch_data_samples, iteration):
-        if not is_main_process():
-            return
-
-        import open3d as o3d
-
-        self.reconstruction_vis_dir.mkdir(parents=True, exist_ok=True)
-        for batch_index, data_sample in enumerate(batch_data_samples):
-            metadata = data_sample.metainfo
-            lidar_path, gt_points = self._load_axis_aligned_gt_points(metadata)
-
-            gt_points = self._limit_visualization_points(
-                gt_points, self.reconstruction_vis_max_points)
-            vggt_points = reconstructed_points[batch_index].float().cpu().numpy()
-            vggt_points = vggt_points[np.isfinite(vggt_points).all(axis=1)]
-            vggt_points = self._limit_visualization_points(
-                vggt_points, self.reconstruction_vis_max_points)
-            combined_scene_points = np.concatenate(
-                [gt_points, vggt_points], axis=0)
-            axis_points, axis_colors = self._coordinate_axis_points(
-                combined_scene_points)
-
-            gt_colors = np.broadcast_to(
-                np.array([0x28, 0x78, 0xD4], dtype=np.float32) / 255.0,
-                gt_points.shape)
-            vggt_colors = np.broadcast_to(
-                np.array([0xE7, 0x6F, 0x23], dtype=np.float32) / 255.0,
-                vggt_points.shape)
-            points = np.concatenate(
-                [gt_points, vggt_points, axis_points], axis=0)
-            colors = np.concatenate(
-                [gt_colors, vggt_colors, axis_colors], axis=0)
-
-            cloud = o3d.geometry.PointCloud()
-            cloud.points = o3d.utility.Vector3dVector(
-                points.astype(np.float64, copy=False))
-            cloud.colors = o3d.utility.Vector3dVector(
-                colors.astype(np.float64, copy=False))
-            output_path = self.reconstruction_vis_dir / (
-                f'iter_{iteration:06d}_{lidar_path.stem}.ply')
-            if not o3d.io.write_point_cloud(
-                    str(output_path), cloud, write_ascii=False):
-                raise RuntimeError(f'Could not write point cloud: {output_path}')
 
     @torch.no_grad()
     def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images,
@@ -543,8 +458,7 @@ class ReconDet(Base3DDetector):
         return feature_maps
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
-                         images, batch_data_samples,
-                         visualization_iteration=None):
+                         images, batch_data_samples):
         if not self.if_use_pred_pc_query:
             raise ValueError(
                 'Projected deformable attention requires VGGT point queries')
@@ -554,9 +468,6 @@ class ReconDet(Base3DDetector):
         pred_pc, vggt_extrinsics, vggt_intrinsics = self.pred_pc_from_vggt(
             vggt_token_list, ps_idx, images, batch_inputs_dict,
             batch_data_samples)
-        if visualization_iteration is not None:
-            self._save_reconstruction_visualization(
-                pred_pc, batch_data_samples, visualization_iteration)
         batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
         batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
 
@@ -598,22 +509,16 @@ class ReconDet(Base3DDetector):
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
-        self._train_visualization_step += 1
-        visualization_iteration = None
-        if (self.reconstruction_vis_interval and
-                self._train_visualization_step %
-                self.reconstruction_vis_interval == 0):
-            visualization_iteration = self._train_visualization_step
 
         if self.if_mix_precision:
             with autocast(img.device):
                 box_features, refined_query_xyz = self.get_box_features(
                     vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    batch_data_samples, visualization_iteration)
+                    batch_data_samples)
         else:
             box_features, refined_query_xyz = self.get_box_features(
                 vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples, visualization_iteration)
+                batch_data_samples)
 
         losses = self.bbox_head.loss(
             box_features,
