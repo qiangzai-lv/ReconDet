@@ -110,7 +110,8 @@ class ReconDet(Base3DDetector):
             feedforward_channels=decoder_cfg['dec_ffn_dim'],
             num_feature_levels=4 if use_multi_layers else 1,
             num_points=deformable_num_points,
-            dropout=decoder_cfg['dec_dropout'])
+            dropout=decoder_cfg['dec_dropout'],
+            reference_update_layer_ids=self.bbox_head.loss_layer_ids)
 
         if if_simpler_project:
             if use_multi_layers:
