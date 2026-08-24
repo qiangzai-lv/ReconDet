@@ -69,7 +69,7 @@ model = dict(
         loss_layer_ids=list(range(_decoder_layer_num)),
         size_logit_range=(-10.0, 10.0)
     ),
-    num_queries=900,
+    num_queries=256,
     token_dim=_token_dim_,
     test_only_last_layer=True,
     if_mix_precision=True,
