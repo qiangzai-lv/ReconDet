@@ -660,6 +660,7 @@ class MultiViewPipeline_Tgt(BaseTransform):
         imgs = []
         depths = []
         extrinsics = []
+        intrinsics = []
         c2ws = []
         camrotc2ws = []
         lightposes = []
@@ -737,6 +738,10 @@ class MultiViewPipeline_Tgt(BaseTransform):
             ori_shape = _results['ori_shape'] # (968, 1296)
             aft_shape = _results['img_shape'] # (239, 320)
             ratio = ori_shape[0] / aft_shape[0]
+            intrinsic = results['lidar2img']['intrinsic'][:3, :3].copy()
+            intrinsic[0] *= aft_shape[1] / ori_shape[1]
+            intrinsic[1] *= aft_shape[0] / ori_shape[0]
+            intrinsics.append(intrinsic.astype(np.float32))
             # prepare the depth information
             if 'depth_info' in results.keys():
                 if '.npy' in results['depth_info'][i]['filename']:
@@ -849,6 +854,10 @@ class MultiViewPipeline_Tgt(BaseTransform):
         if len(depths) != 0:
             results['depth'] = depths
         results['lidar2img']['extrinsic'] = extrinsics # w2c src view.
+        results['gt_camera_extrinsics'] = np.asarray(
+            extrinsics, dtype=np.float32)[:, :3, :]
+        results['gt_camera_intrinsics'] = np.asarray(
+            intrinsics, dtype=np.float32)
         return results
 
 

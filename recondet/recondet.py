@@ -81,6 +81,7 @@ class ReconDet(Base3DDetector):
             depth_thres=1000,
             vggt_omega_checkpoint=None,
             deformable_num_points=4,
+            geometry_source='vggt',
             gt_points_dir=None,
             online_scale_point_stride=4,
             online_scale_max_depth=30.0,
@@ -185,8 +186,12 @@ class ReconDet(Base3DDetector):
 
         self.use_multi_layers = use_multi_layers
         self.depth_thres = depth_thres
+        if geometry_source not in {'vggt', 'gt'}:
+            raise ValueError(
+                "geometry_source must be either 'vggt' or 'gt'")
+        self.geometry_source = geometry_source
         if gt_points_dir is None:
-            raise ValueError('Online scene scaling requires gt_points_dir')
+            raise ValueError('GT point-cloud loading requires gt_points_dir')
         if online_scale_point_stride <= 0:
             raise ValueError('online_scale_point_stride must be positive')
         if online_scale_max_depth <= 1e-4:
@@ -457,25 +462,68 @@ class ReconDet(Base3DDetector):
                     patch_height, patch_width).contiguous())
         return feature_maps
 
+    @torch.no_grad()
+    def _get_gt_geometry(self, images, batch_inputs_dict,
+                         batch_data_samples):
+        query_points = []
+        point_mins = []
+        point_maxs = []
+        for data_sample in batch_data_samples:
+            _, gt_points = self._load_axis_aligned_gt_points(
+                data_sample.metainfo)
+            points = torch.as_tensor(
+                gt_points, device=images.device, dtype=torch.float32)
+            points = points[torch.isfinite(points).all(dim=-1)]
+            if len(points) == 0:
+                raise ValueError('Axis-aligned GT point cloud is empty')
+            query_points.append(
+                self._farthest_point_sample(points, self.num_queries))
+            point_mins.append(points.amin(dim=0))
+            point_maxs.append(points.amax(dim=0))
+
+        query_xyz = torch.stack(query_points)
+        point_min = torch.stack(point_mins)
+        point_max = torch.stack(point_maxs)
+        extrinsics = self._batch_tensor(
+            batch_inputs_dict['gt_camera_extrinsics'], images)
+        intrinsics = self._batch_tensor(
+            batch_inputs_dict['gt_camera_intrinsics'], images)
+
+        batch_size, num_views = images.shape[:2]
+        if extrinsics.shape != (batch_size, num_views, 3, 4):
+            raise ValueError(
+                'GT camera extrinsics must have shape [B, V, 3, 4], got '
+                f'{tuple(extrinsics.shape)}')
+        if intrinsics.shape != (batch_size, num_views, 3, 3):
+            raise ValueError(
+                'GT camera intrinsics must have shape [B, V, 3, 3], got '
+                f'{tuple(intrinsics.shape)}')
+        return query_xyz, point_min, point_max, extrinsics, intrinsics
+
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
                          images, batch_data_samples):
         if not self.if_use_pred_pc_query:
             raise ValueError(
-                'Projected deformable attention requires VGGT point queries')
+                'Projected deformable attention requires point queries')
 
         feature_maps = self._build_patch_feature_maps(
             vggt_token_list, ps_idx, images.shape[-2:])
-        pred_pc, vggt_extrinsics, vggt_intrinsics = self.pred_pc_from_vggt(
-            vggt_token_list, ps_idx, images, batch_inputs_dict,
-            batch_data_samples)
-        batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
-        batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
+        if self.geometry_source == 'gt':
+            (query_xyz, point_min, point_max,
+             camera_extrinsics, camera_intrinsics) = self._get_gt_geometry(
+                 images, batch_inputs_dict, batch_data_samples)
+        else:
+            pred_pc, camera_extrinsics, camera_intrinsics = \
+                self.pred_pc_from_vggt(
+                    vggt_token_list, ps_idx, images, batch_inputs_dict,
+                    batch_data_samples)
+            batch_inputs_dict['vggt_extrinsics'] = camera_extrinsics
+            batch_inputs_dict['vggt_intrinsics'] = camera_intrinsics
+            query_xyz, _ = self.get_query_embeddings(
+                pred_pc, point_cloud_dims=None)
+            point_min = pred_pc.amin(dim=1)
+            point_max = pred_pc.amax(dim=1)
 
-        query_xyz, _ = self.get_query_embeddings(
-            pred_pc, point_cloud_dims=None)
-
-        point_min = pred_pc.amin(dim=1)
-        point_max = pred_pc.amax(dim=1)
         point_extent = (point_max - point_min).clamp_min(1e-3)
         range_padding = point_extent * 0.05
         reference_min = point_min - range_padding
@@ -497,8 +545,8 @@ class ReconDet(Base3DDetector):
             reference_points,
             reference_min,
             reference_max,
-            vggt_extrinsics,
-            vggt_intrinsics,
+            camera_extrinsics,
+            camera_intrinsics,
             images.shape[-2:],
             self.pos_embedding,
             self.query_projection,

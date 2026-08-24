@@ -35,6 +35,7 @@ model = dict(
         dec_nlayers=_decoder_layer_num
     ),
     deformable_num_points=4,
+    geometry_source='gt',
     gt_points_dir=f'{data_root}/points',
     online_scale_point_stride=4,
     online_scale_max_depth=30.0,
@@ -90,11 +91,13 @@ class_names = [
 ]
 
 train_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix',
+    'gt_camera_extrinsics', 'gt_camera_intrinsics'
 ]
 
 test_collect_keys = [
-    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix'
+    'img', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix',
+    'gt_camera_extrinsics', 'gt_camera_intrinsics'
 ]
 
 input_modality = dict(
