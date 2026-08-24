@@ -1,8 +1,11 @@
+from pathlib import Path
 from typing import List, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 
+from mmengine.dist import is_main_process
 from mmdet3d.models.detectors import Base3DDetector
 from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
@@ -79,6 +82,12 @@ class ReconDet(Base3DDetector):
             depth_thres=1000,
             vggt_omega_checkpoint=None,
             deformable_num_points=4,
+            reconstruction_vis_interval=0,
+            reconstruction_vis_dir=None,
+            reconstruction_vis_max_points=100000,
+            gt_points_dir=None,
+            online_scale_point_stride=4,
+            online_scale_max_depth=30.0,
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -180,6 +189,29 @@ class ReconDet(Base3DDetector):
 
         self.use_multi_layers = use_multi_layers
         self.depth_thres = depth_thres
+        if reconstruction_vis_interval < 0:
+            raise ValueError('reconstruction_vis_interval must be non-negative')
+        if reconstruction_vis_max_points <= 0:
+            raise ValueError('reconstruction_vis_max_points must be positive')
+        if gt_points_dir is None:
+            raise ValueError('Online scene scaling requires gt_points_dir')
+        if online_scale_point_stride <= 0:
+            raise ValueError('online_scale_point_stride must be positive')
+        if online_scale_max_depth <= 1e-4:
+            raise ValueError('online_scale_max_depth must be greater than 1e-4')
+        if reconstruction_vis_interval and reconstruction_vis_dir is None:
+            raise ValueError(
+                'Reconstruction visualization requires an output directory')
+        self.reconstruction_vis_interval = reconstruction_vis_interval
+        self.reconstruction_vis_dir = (
+            Path(reconstruction_vis_dir)
+            if reconstruction_vis_dir is not None else None)
+        self.reconstruction_vis_max_points = reconstruction_vis_max_points
+        self.gt_points_dir = Path(gt_points_dir)
+        self.online_scale_point_stride = online_scale_point_stride
+        self.online_scale_max_depth = online_scale_max_depth
+        self._gt_scene_diagonal_cache = {}
+        self._train_visualization_step = 0
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -217,8 +249,203 @@ class ReconDet(Base3DDetector):
 
         return points[batch_indices, indices]
 
+    @staticmethod
+    def _batch_tensor(value, reference):
+        if isinstance(value, torch.Tensor):
+            tensor = value
+        elif isinstance(value, (int, float)):
+            tensor = torch.as_tensor([value])
+        else:
+            tensor = torch.stack([
+                item if isinstance(item, torch.Tensor) else torch.as_tensor(item)
+                for item in value
+            ], dim=0)
+        return tensor.to(device=reference.device, dtype=torch.float32)
+
+    @staticmethod
     @torch.no_grad()
-    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images):
+    def _align_vggt_reconstruction(point_map, extrinsics, pose_matrix,
+                                   axis_align_matrix, scene_scale):
+        batch_size = point_map.shape[0]
+        pose_matrix = ReconDet._batch_tensor(
+            pose_matrix, point_map).reshape(batch_size, 4, 4)
+        axis_align_matrix = ReconDet._batch_tensor(
+            axis_align_matrix, point_map).reshape(batch_size, 4, 4)
+        scene_scale = ReconDet._batch_tensor(
+            scene_scale, point_map).reshape(batch_size)
+
+        if extrinsics.shape[-2:] == (3, 4):
+            extrinsics_h = extrinsics.new_zeros(
+                *extrinsics.shape[:-2], 4, 4)
+            extrinsics_h[..., :3, :] = extrinsics
+            extrinsics_h[..., 3, 3] = 1
+        elif extrinsics.shape[-2:] == (4, 4):
+            extrinsics_h = extrinsics
+        else:
+            raise ValueError(
+                'VGGT extrinsics must have shape [B, V, 3, 4] or '
+                '[B, V, 4, 4]')
+        extrinsics_h = extrinsics_h.float()
+
+        with torch.autocast(device_type=point_map.device.type, enabled=False):
+            first_w2c = extrinsics_h[:, 0]
+            alignment = torch.bmm(
+                axis_align_matrix, torch.bmm(pose_matrix, first_w2c))
+
+            scaled_points = point_map.float() * scene_scale.view(
+                batch_size, 1, 1, 1, 1)
+            aligned_points = torch.einsum(
+                'bij,bvhwj->bvhwi', alignment[:, :3, :3], scaled_points)
+            aligned_points = aligned_points + alignment[
+                :, None, None, None, :3, 3]
+
+            scale_matrix = torch.eye(
+                4, device=point_map.device, dtype=torch.float32).repeat(
+                    batch_size, 1, 1)
+            scale_matrix[:, :3, :3] *= scene_scale[:, None, None]
+            vggt_to_aligned = torch.bmm(alignment, scale_matrix)
+            scaled_camera_extrinsics = torch.matmul(
+                scale_matrix[:, None], extrinsics_h)
+            aligned_extrinsics = torch.matmul(
+                scaled_camera_extrinsics,
+                torch.linalg.inv(vggt_to_aligned)[:, None])
+
+        return aligned_points, aligned_extrinsics[..., :3, :]
+
+    @staticmethod
+    def _limit_visualization_points(points, max_points):
+        if len(points) <= max_points:
+            return points
+        step = (len(points) + max_points - 1) // max_points
+        return points[::step][:max_points]
+
+    @staticmethod
+    def _robust_scene_diagonal(points):
+        lower, upper = np.quantile(points, [0.01, 0.99], axis=0)
+        return float(np.linalg.norm(upper - lower))
+
+    def _load_axis_aligned_gt_points(self, metadata):
+        lidar_path = Path(metadata['lidar_path'])
+        if not lidar_path.is_absolute():
+            lidar_path = self.gt_points_dir / lidar_path.name
+        point_dim = int(metadata.get('num_pts_feats', 6))
+        raw_gt_points = np.fromfile(lidar_path, dtype=np.float32)
+        if raw_gt_points.size % point_dim:
+            raise ValueError(f'Unexpected GT point-cloud shape in {lidar_path}')
+        gt_points = raw_gt_points.reshape(-1, point_dim)[:, :3]
+        axis_align_matrix = metadata['axis_align_matrix']
+        if isinstance(axis_align_matrix, torch.Tensor):
+            axis_align_matrix = axis_align_matrix.cpu().numpy()
+        axis_align_matrix = np.asarray(axis_align_matrix, dtype=np.float32)
+        if axis_align_matrix.shape != (4, 4):
+            raise ValueError('axis_align_matrix must have shape [4, 4]')
+        gt_points = (
+            gt_points @ axis_align_matrix[:3, :3].T +
+            axis_align_matrix[:3, 3])
+        return lidar_path, gt_points
+
+    @torch.no_grad()
+    def _estimate_online_scene_scale(
+            self, point_map, depth_map, batch_data_samples):
+        stride = self.online_scale_point_stride
+        scales = []
+        for batch_index, data_sample in enumerate(batch_data_samples):
+            metadata = data_sample.metainfo
+            lidar_path = Path(metadata['lidar_path'])
+            cache_key = str(lidar_path)
+            if cache_key not in self._gt_scene_diagonal_cache:
+                _, gt_points = self._load_axis_aligned_gt_points(metadata)
+                gt_diagonal = self._robust_scene_diagonal(gt_points)
+                self._gt_scene_diagonal_cache[cache_key] = gt_diagonal
+            else:
+                gt_diagonal = self._gt_scene_diagonal_cache[cache_key]
+
+            sampled_points = point_map[
+                batch_index, :, ::stride, ::stride].reshape(-1, 3)
+            sampled_depth = depth_map[
+                batch_index, :, ::stride, ::stride].reshape(-1)
+            valid = torch.isfinite(sampled_points).all(dim=-1)
+            valid &= torch.isfinite(sampled_depth)
+            valid &= sampled_depth > 1e-4
+            valid &= sampled_depth < self.online_scale_max_depth
+            sampled_points = sampled_points[valid]
+            if len(sampled_points) == 0:
+                raise ValueError('VGGT reconstruction has no valid scale points')
+            vggt_points = sampled_points.float().cpu().numpy()
+            vggt_diagonal = self._robust_scene_diagonal(vggt_points)
+            if not np.isfinite(vggt_diagonal) or vggt_diagonal <= 1e-6:
+                raise ValueError(
+                    f'VGGT point-cloud range is too small: {vggt_diagonal}')
+            scene_scale = gt_diagonal / vggt_diagonal
+            if not np.isfinite(scene_scale) or scene_scale <= 0:
+                raise ValueError(f'Invalid online scene scale: {scene_scale}')
+            scales.append(scene_scale)
+        return point_map.new_tensor(scales, dtype=torch.float32)
+
+    @staticmethod
+    def _coordinate_axis_points(points, num_points=512):
+        lower, upper = np.quantile(points, [0.01, 0.99], axis=0)
+        axis_length = max(float((upper - lower).max()) * 0.18, 0.1)
+        distance = np.linspace(
+            0.0, axis_length, num_points, dtype=np.float32)
+        axis_points = np.zeros((num_points * 3, 3), dtype=np.float32)
+        axis_colors = np.zeros_like(axis_points)
+        for axis_index in range(3):
+            start = axis_index * num_points
+            end = start + num_points
+            axis_points[start:end, axis_index] = distance
+            axis_colors[start:end, axis_index] = 1.0
+        return axis_points, axis_colors
+
+    @torch.no_grad()
+    def _save_reconstruction_visualization(
+            self, reconstructed_points, batch_data_samples, iteration):
+        if not is_main_process():
+            return
+
+        import open3d as o3d
+
+        self.reconstruction_vis_dir.mkdir(parents=True, exist_ok=True)
+        for batch_index, data_sample in enumerate(batch_data_samples):
+            metadata = data_sample.metainfo
+            lidar_path, gt_points = self._load_axis_aligned_gt_points(metadata)
+
+            gt_points = self._limit_visualization_points(
+                gt_points, self.reconstruction_vis_max_points)
+            vggt_points = reconstructed_points[batch_index].float().cpu().numpy()
+            vggt_points = vggt_points[np.isfinite(vggt_points).all(axis=1)]
+            vggt_points = self._limit_visualization_points(
+                vggt_points, self.reconstruction_vis_max_points)
+            combined_scene_points = np.concatenate(
+                [gt_points, vggt_points], axis=0)
+            axis_points, axis_colors = self._coordinate_axis_points(
+                combined_scene_points)
+
+            gt_colors = np.broadcast_to(
+                np.array([0x28, 0x78, 0xD4], dtype=np.float32) / 255.0,
+                gt_points.shape)
+            vggt_colors = np.broadcast_to(
+                np.array([0xE7, 0x6F, 0x23], dtype=np.float32) / 255.0,
+                vggt_points.shape)
+            points = np.concatenate(
+                [gt_points, vggt_points, axis_points], axis=0)
+            colors = np.concatenate(
+                [gt_colors, vggt_colors, axis_colors], axis=0)
+
+            cloud = o3d.geometry.PointCloud()
+            cloud.points = o3d.utility.Vector3dVector(
+                points.astype(np.float64, copy=False))
+            cloud.colors = o3d.utility.Vector3dVector(
+                colors.astype(np.float64, copy=False))
+            output_path = self.reconstruction_vis_dir / (
+                f'iter_{iteration:06d}_{lidar_path.stem}.ply')
+            if not o3d.io.write_point_cloud(
+                    str(output_path), cloud, write_ascii=False):
+                raise RuntimeError(f'Could not write point cloud: {output_path}')
+
+    @torch.no_grad()
+    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images,
+                          batch_inputs_dict, batch_data_samples):
 
         with torch.no_grad():
             with autocast(images.device):
@@ -235,7 +462,6 @@ class ReconDet(Base3DDetector):
                 )
                 # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
                 extrinsic, intrinsic = encoding_to_camera(pose_enc, images.shape[-2:])
-                predicted_first_w2c = extrinsic[:, 0].detach()
 
                 depth_map, depth_conf = self.vggt_encoder.dense_head(
                     aggregated_tokens_list,
@@ -250,6 +476,17 @@ class ReconDet(Base3DDetector):
                 point_map_by_unprojection_tensor = \
                     unproject_depth_map_to_point_map_torch(
                         depth_map, extrinsic, intrinsic)
+                scene_scale = self._estimate_online_scene_scale(
+                    point_map_by_unprojection_tensor, depth_map,
+                    batch_data_samples)
+                batch_inputs_dict['scene_scale'] = scene_scale.detach()
+                point_map_by_unprojection_tensor, aligned_extrinsic = \
+                    self._align_vggt_reconstruction(
+                        point_map_by_unprojection_tensor,
+                        extrinsic,
+                        batch_inputs_dict['pose_matrix'],
+                        batch_inputs_dict['axis_align_matrix'],
+                        scene_scale)
                 point_map_by_unprojection_tensor = \
                     point_map_by_unprojection_tensor.reshape(
                         point_map_by_unprojection_tensor.shape[0], -1,
@@ -267,7 +504,7 @@ class ReconDet(Base3DDetector):
                 del point_map_by_unprojection_tensor
 
                 return (sampled_point_map_by_unprojection_tensor.detach(),
-                        predicted_first_w2c, extrinsic.detach(),
+                        aligned_extrinsic.detach(),
                         intrinsic.detach())
 
     def _build_patch_feature_maps(self, vggt_token_list, ps_idx,
@@ -306,17 +543,20 @@ class ReconDet(Base3DDetector):
         return feature_maps
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
-                         images):
+                         images, batch_data_samples,
+                         visualization_iteration=None):
         if not self.if_use_pred_pc_query:
             raise ValueError(
                 'Projected deformable attention requires VGGT point queries')
 
         feature_maps = self._build_patch_feature_maps(
             vggt_token_list, ps_idx, images.shape[-2:])
-        (pred_pc, predicted_first_w2c, vggt_extrinsics,
-         vggt_intrinsics) = self.pred_pc_from_vggt(
-             vggt_token_list, ps_idx, images)
-        batch_inputs_dict['predicted_first_w2c'] = predicted_first_w2c
+        pred_pc, vggt_extrinsics, vggt_intrinsics = self.pred_pc_from_vggt(
+            vggt_token_list, ps_idx, images, batch_inputs_dict,
+            batch_data_samples)
+        if visualization_iteration is not None:
+            self._save_reconstruction_visualization(
+                pred_pc, batch_data_samples, visualization_iteration)
         batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
         batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
 
@@ -358,14 +598,22 @@ class ReconDet(Base3DDetector):
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
+        self._train_visualization_step += 1
+        visualization_iteration = None
+        if (self.reconstruction_vis_interval and
+                self._train_visualization_step %
+                self.reconstruction_vis_interval == 0):
+            visualization_iteration = self._train_visualization_step
 
         if self.if_mix_precision:
             with autocast(img.device):
                 box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img)
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    batch_data_samples, visualization_iteration)
         else:
             box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img)
+                vggt_token_list, ps_idx, batch_inputs_dict, img,
+                batch_data_samples, visualization_iteration)
 
         losses = self.bbox_head.loss(
             box_features,
@@ -384,10 +632,12 @@ class ReconDet(Base3DDetector):
         if self.if_mix_precision:
             with autocast(img.device):
                 box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img)
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    batch_data_samples)
         else:
             box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img)
+                vggt_token_list, ps_idx, batch_inputs_dict, img,
+                batch_data_samples)
 
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
@@ -414,10 +664,12 @@ class ReconDet(Base3DDetector):
         if self.if_mix_precision:
             with autocast(img.device):
                 box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img)
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    batch_data_samples)
         else:
             box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img)
+                vggt_token_list, ps_idx, batch_inputs_dict, img,
+                batch_data_samples)
 
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:

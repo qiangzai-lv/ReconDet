@@ -165,62 +165,6 @@ class ReconDetHead(BaseModule):
             cls_preds.append(self.semcls_heads[layer_id](feature))
         return center_preds, size_preds, cls_preds
 
-    @staticmethod
-    def _batch_tensor(value, reference):
-        if isinstance(value, torch.Tensor):
-            tensor = value
-        elif isinstance(value, (int, float)):
-            tensor = torch.as_tensor([value])
-        else:
-            tensor = torch.stack([
-                item if isinstance(item, torch.Tensor) else torch.as_tensor(item)
-                for item in value
-            ], dim=0)
-        return tensor.to(device=reference.device, dtype=torch.float32)
-
-    def _transform_bbox_predictions(self, center_preds, size_preds,
-                                    batch_inputs_dict):
-        reference = center_preds[0]
-        pose_matrix = self._batch_tensor(
-            batch_inputs_dict['pose_matrix'], reference)
-        axis_align_matrix = self._batch_tensor(
-            batch_inputs_dict['axis_align_matrix'], reference)
-        predicted_first_w2c = self._batch_tensor(
-            batch_inputs_dict['predicted_first_w2c'], reference)
-        scene_scale = self._batch_tensor(
-            batch_inputs_dict['scene_scale'], reference).reshape(
-                reference.shape[0], 1, 1)
-
-        if pose_matrix.shape[-2:] != (4, 4):
-            raise ValueError('pose_matrix must have shape [B, 4, 4]')
-        if axis_align_matrix.shape[-2:] != (4, 4):
-            raise ValueError('axis_align_matrix must have shape [B, 4, 4]')
-        if predicted_first_w2c.shape[-2:] == (3, 4):
-            bottom_row = predicted_first_w2c.new_zeros(
-                predicted_first_w2c.shape[0], 1, 4)
-            bottom_row[..., 0, 3] = 1
-            predicted_first_w2c = torch.cat(
-                [predicted_first_w2c, bottom_row], dim=1)
-        if predicted_first_w2c.shape[-2:] != (4, 4):
-            raise ValueError(
-                'predicted_first_w2c must have shape [B, 3, 4] or [B, 4, 4]')
-
-        transform = torch.bmm(
-            axis_align_matrix,
-            torch.bmm(pose_matrix, predicted_first_w2c))
-        transformed_centers = []
-        transformed_sizes = []
-        for centers, sizes in zip(center_preds, size_preds):
-            scaled_centers = centers.float() * scene_scale
-            ones = scaled_centers.new_ones(
-                scaled_centers.shape[0], 1, scaled_centers.shape[2])
-            homogeneous_centers = torch.cat([scaled_centers, ones], dim=1)
-            aligned_centers = torch.bmm(
-                transform, homogeneous_centers)[:, :3, :]
-            transformed_centers.append(aligned_centers)
-            transformed_sizes.append(sizes.float() * scene_scale)
-        return transformed_centers, transformed_sizes
-
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
              batch_inputs_dict: dict, refined_query_xyz=None, **kwargs) -> dict:
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
@@ -235,8 +179,6 @@ class ReconDetHead(BaseModule):
             batch_inputs_dict,
             supervised_references,
             layer_ids)
-        center_preds, size_preds = self._transform_bbox_predictions(
-            center_preds, size_preds, batch_inputs_dict)
 
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -370,8 +312,6 @@ class ReconDetHead(BaseModule):
         ]
         center_preds, size_preds, cls_preds = self(
             x, batch_inputs_dict, refined_query_xyz, layer_ids)
-        center_preds, size_preds = self._transform_bbox_predictions(
-            center_preds, size_preds, batch_inputs_dict)
         predictions = self.predict_by_feat(
             center_preds, size_preds, cls_preds,
             batch_input_metas=batch_input_metas,
