@@ -5,9 +5,11 @@ from .multiview_pipeline import (LoadFirstFramePose,
 from .scannet_multiview_dataset import MultiViewScanNetDataset
 from .recondet import ReconDet
 from .recondet_head import ReconDetHead
+from .point_bbox_reconstruction_head import PointBBoxReconstructionHead
 
 __all__ = [
     'MultiViewScanNetDataset', 'MultiViewPipeline', 'RandomShiftOrigin',
     'LoadFirstFramePose', 'PackNeRFDetInputs',
-    'VGGTDetDataPreprocessor', 'ReconDetHead'
+    'VGGTDetDataPreprocessor', 'ReconDetHead',
+    'PointBBoxReconstructionHead'
 ]

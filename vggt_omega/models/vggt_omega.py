@@ -33,6 +33,10 @@ class VGGTOmega(nn.Module):
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
 
+    def initialize_object_query_branch(self, num_queries: int = 64) -> None:
+        self.aggregator.initialize_object_query_branch(
+            num_queries=num_queries)
+
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)

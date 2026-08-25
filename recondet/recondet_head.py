@@ -135,19 +135,23 @@ class ReconDetHead(BaseModule):
         self.scales = nn.ModuleList([Scale(1.) for _ in range(n_levels)])
 
     def forward(self, x, batch_inputs_dict, refined_query_xyz=None,
-                layer_ids=None):
+                layer_ids=None, initial_query_sizes=None):
         if layer_ids is None:
             layer_ids = list(range(len(x)))
         if len(layer_ids) != len(x):
             raise ValueError('Layer ids must match decoder outputs')
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Refined references must match decoder outputs')
+        if initial_query_sizes is not None and len(initial_query_sizes) != len(x):
+            raise ValueError('Initial sizes must match decoder outputs')
 
         center_preds = []
         size_preds = []
         cls_preds = []
-        for feature, center, layer_id in zip(
-                x, refined_query_xyz, layer_ids):
+        if initial_query_sizes is None:
+            initial_query_sizes = [None] * len(x)
+        for feature, center, initial_size, layer_id in zip(
+                x, refined_query_xyz, initial_query_sizes, layer_ids):
             center_preds.append(center.permute(0, 2, 1))
             size_logits = self.scales[layer_id](
                 self.size_heads[layer_id](feature))
@@ -161,12 +165,17 @@ class ReconDetHead(BaseModule):
                 # gradients for logits that have crossed the stable range.
                 bounded_logits = size_logits + (
                     bounded_logits - size_logits).detach()
-                size_preds.append(torch.exp(bounded_logits))
+                size_prediction = torch.exp(bounded_logits)
+                if initial_size is not None:
+                    size_prediction = (
+                        size_prediction * initial_size.transpose(1, 2))
+                size_preds.append(size_prediction)
             cls_preds.append(self.semcls_heads[layer_id](feature))
         return center_preds, size_preds, cls_preds
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
-             batch_inputs_dict: dict, refined_query_xyz=None, **kwargs) -> dict:
+             batch_inputs_dict: dict, refined_query_xyz=None,
+             initial_query_sizes=None, **kwargs) -> dict:
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Loss requires one refined reference per layer')
         layer_ids = self.loss_layer_ids
@@ -174,11 +183,15 @@ class ReconDetHead(BaseModule):
         supervised_references = [
             refined_query_xyz[layer_id] for layer_id in layer_ids
         ]
+        supervised_sizes = (None if initial_query_sizes is None else [
+            initial_query_sizes[layer_id] for layer_id in layer_ids
+        ])
         center_preds, size_preds, cls_preds = self(
             supervised_features,
             batch_inputs_dict,
             supervised_references,
-            layer_ids)
+            layer_ids,
+            supervised_sizes)
 
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -305,13 +318,15 @@ class ReconDetHead(BaseModule):
                 x: Tuple[Tensor],
                 batch_data_samples: SampleList, batch_inputs_dict,
                 refined_query_xyz=None, layer_ids=None,
+                initial_query_sizes=None,
                 rescale: bool = False) -> InstanceList:
 
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
         center_preds, size_preds, cls_preds = self(
-            x, batch_inputs_dict, refined_query_xyz, layer_ids)
+            x, batch_inputs_dict, refined_query_xyz, layer_ids,
+            initial_query_sizes)
         predictions = self.predict_by_feat(
             center_preds, size_preds, cls_preds,
             batch_input_metas=batch_input_metas,

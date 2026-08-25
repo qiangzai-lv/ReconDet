@@ -64,12 +64,14 @@ class ReconDet(Base3DDetector):
     def __init__(
             self,
             bbox_head: ConfigType,
+            reconstruction_head: ConfigType,
             train_cfg: OptConfigType = None,
             test_cfg: OptConfigType = None,
             data_preprocessor: OptConfigType = None,
             init_cfg: OptConfigType = None,
             decoder_cfg: OptConfigType = None,
             num_queries=128,
+            num_reconstruction_queries=64,
             token_dim=1024,
             test_only_last_layer=True,
             position_embedding="fourier",
@@ -91,17 +93,26 @@ class ReconDet(Base3DDetector):
         bbox_head.update(train_cfg=train_cfg)
         bbox_head.update(test_cfg=test_cfg)
         self.bbox_head = MODELS.build(bbox_head)
+        self.reconstruction_head = MODELS.build(reconstruction_head)
 
         self.vggt_encoder = VGGTOmega()
         self.vggt_encoder.load_state_dict(
             torch.load(vggt_omega_checkpoint, map_location='cpu', weights_only=True)
         )
-        self.vggt_encoder.to(device)
 
         for param in self.vggt_encoder.parameters():
             param.requires_grad = False
 
+        self.vggt_encoder.initialize_object_query_branch(
+            num_queries=num_reconstruction_queries)
+        self.vggt_encoder.aggregator.set_object_query_uv_delta_predictor(
+            self.reconstruction_head.predict_uv_delta)
+        self.vggt_encoder.to(device)
+
         self.vggt_encoder.eval()
+
+        self.reconstruction_query_proj = nn.Linear(
+            reconstruction_head.get('hidden_dim', token_dim), token_dim)
 
         self.decoder = GeometryAwareDeformableDecoder(
             embed_dims=token_dim,
@@ -196,24 +207,22 @@ class ReconDet(Base3DDetector):
         self.online_scale_max_depth = online_scale_max_depth
         self._gt_scene_diagonal_cache = {}
 
-    @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
                      batch_data_samples: SampleList, mode):
 
-        if self.vggt_encoder.training:
-            for param in self.vggt_encoder.parameters():
-                param.requires_grad = False
+        self.vggt_encoder.eval()
+        self.vggt_encoder.aggregator.object_query_branch.train(
+            mode == 'train')
 
-            self.vggt_encoder.eval()
-
-        with torch.no_grad():
-            # The data preprocessor converts raw BGR uint8 images to RGB without
-            # normalization. VGGT-Omega expects RGB values in [0, 1].
-            img = batch_inputs_dict['imgs'].float().div(255.0)
-            with autocast(img.device):
-                aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(
-                    img)
-                return aggregated_tokens_list, ps_idx, img
+        # The data preprocessor converts raw BGR uint8 images to RGB without
+        # normalization. VGGT-Omega expects RGB values in [0, 1].
+        img = batch_inputs_dict['imgs'].float().div(255.0)
+        with autocast(img.device):
+            (aggregated_tokens_list, ps_idx, object_features,
+             reference_uv, reference_uv_layers) = self.vggt_encoder.aggregator(
+                img, return_object_queries=True)
+        return (aggregated_tokens_list, ps_idx, img, object_features,
+                reference_uv, reference_uv_layers)
 
     @torch.no_grad()
     def batch_random_sample(self, points, k=100000, depth_mask=None):
@@ -458,96 +467,105 @@ class ReconDet(Base3DDetector):
         return feature_maps
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
-                         images, batch_data_samples):
+                         images, object_features, reference_uv,
+                         batch_data_samples, reference_uv_layers=None):
         if not self.if_use_pred_pc_query:
             raise ValueError(
                 'Projected deformable attention requires VGGT point queries')
 
         feature_maps = self._build_patch_feature_maps(
             vggt_token_list, ps_idx, images.shape[-2:])
-        pred_pc, vggt_extrinsics, vggt_intrinsics = self.pred_pc_from_vggt(
+        _, vggt_extrinsics, vggt_intrinsics = self.pred_pc_from_vggt(
             vggt_token_list, ps_idx, images, batch_inputs_dict,
             batch_data_samples)
         batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
         batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
 
-        query_xyz, _ = self.get_query_embeddings(
-            pred_pc, point_cloud_dims=None)
-
-        point_min = pred_pc.amin(dim=1)
-        point_max = pred_pc.amax(dim=1)
-        point_extent = (point_max - point_min).clamp_min(1e-3)
-        range_padding = point_extent * 0.05
-        reference_min = point_min - range_padding
-        reference_max = point_max + range_padding
-        reference_points = (
-            (query_xyz - reference_min[:, None]) /
-            (reference_max - reference_min)[:, None]).clamp(1e-5, 1 - 1e-5)
+        point_predictions = self.reconstruction_head(
+            object_features, reference_uv,
+            reference_uv_layers=reference_uv_layers)
+        query_xyz, initial_query_sizes, query_features, _ = \
+            self.reconstruction_head.reconstruct_boxes(point_predictions)
 
         batch_inputs_dict['query_xyz'] = query_xyz
-        batch_inputs_dict['reference_min'] = reference_min
-        batch_inputs_dict['reference_max'] = reference_max
-        batch_size, num_queries = query_xyz.shape[:2]
-        query = torch.zeros(
-            batch_size, num_queries, feature_maps[0].shape[2],
-            device=query_xyz.device, dtype=feature_maps[0].dtype)
-        return self.decoder(
+        query = self.reconstruction_query_proj(query_features).to(
+            feature_maps[0].dtype)
+        box_features, refined_query_xyz = self.decoder(
             query,
             feature_maps,
-            reference_points,
-            reference_min,
-            reference_max,
+            query_xyz,
             vggt_extrinsics,
             vggt_intrinsics,
             images.shape[-2:],
             self.pos_embedding,
             self.query_projection,
             self.bbox_head.center_heads)
+        initial_sizes_per_layer = [initial_query_sizes] * len(box_features)
+        return (box_features, refined_query_xyz, initial_sizes_per_layer,
+                point_predictions)
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
 
-        vggt_token_list, ps_idx, img = self.extract_feat(
-            batch_inputs_dict, batch_data_samples, 'train')
+        (vggt_token_list, ps_idx, img, object_features,
+         reference_uv, reference_uv_layers) = self.extract_feat(
+             batch_inputs_dict, batch_data_samples, 'train')
 
         if self.if_mix_precision:
             with autocast(img.device):
-                box_features, refined_query_xyz = self.get_box_features(
+                (box_features, refined_query_xyz, initial_query_sizes,
+                 point_predictions) = self.get_box_features(
                     vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    batch_data_samples)
+                    object_features, reference_uv, batch_data_samples,
+                    reference_uv_layers)
         else:
-            box_features, refined_query_xyz = self.get_box_features(
+            (box_features, refined_query_xyz, initial_query_sizes,
+             point_predictions) = self.get_box_features(
                 vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples)
+                object_features, reference_uv, batch_data_samples,
+                reference_uv_layers)
 
         losses = self.bbox_head.loss(
             box_features,
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
+            initial_query_sizes=initial_query_sizes,
             **kwargs)
+        reconstruction_losses = self.reconstruction_head.loss(
+            point_predictions, batch_data_samples)
+        losses.update({
+            f'reconstruction_{name}': value
+            for name, value in reconstruction_losses.items()
+        })
         return losses
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:
 
-        vggt_token_list, ps_idx, img = self.extract_feat(
-            batch_inputs_dict, batch_data_samples, 'train')
+        (vggt_token_list, ps_idx, img, object_features,
+         reference_uv, reference_uv_layers) = self.extract_feat(
+             batch_inputs_dict, batch_data_samples, 'predict')
 
         if self.if_mix_precision:
             with autocast(img.device):
-                box_features, refined_query_xyz = self.get_box_features(
+                (box_features, refined_query_xyz, initial_query_sizes,
+                 _) = self.get_box_features(
                     vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    batch_data_samples)
+                    object_features, reference_uv, batch_data_samples,
+                    reference_uv_layers)
         else:
-            box_features, refined_query_xyz = self.get_box_features(
+            (box_features, refined_query_xyz, initial_query_sizes,
+             _) = self.get_box_features(
                 vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples)
+                object_features, reference_uv, batch_data_samples,
+                reference_uv_layers)
 
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
             refined_query_xyz = [refined_query_xyz[-1]]
+            initial_query_sizes = [initial_query_sizes[-1]]
             layer_ids = [layer_ids[-1]]
 
         results_list = self.bbox_head.predict(
@@ -555,6 +573,7 @@ class ReconDet(Base3DDetector):
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
+            initial_query_sizes=initial_query_sizes,
             layer_ids=layer_ids,
             **kwargs)
         predictions = self.add_pred_to_datasample(batch_data_samples,
@@ -563,27 +582,34 @@ class ReconDet(Base3DDetector):
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                  *args, **kwargs) -> Tuple[List[torch.Tensor]]:
-        vggt_token_list, ps_idx, img = self.extract_feat(
-            batch_inputs_dict, batch_data_samples, 'train')
+        (vggt_token_list, ps_idx, img, object_features,
+         reference_uv, reference_uv_layers) = self.extract_feat(
+             batch_inputs_dict, batch_data_samples, 'predict')
 
         if self.if_mix_precision:
             with autocast(img.device):
-                box_features, refined_query_xyz = self.get_box_features(
+                (box_features, refined_query_xyz, initial_query_sizes,
+                 _) = self.get_box_features(
                     vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    batch_data_samples)
+                    object_features, reference_uv, batch_data_samples,
+                    reference_uv_layers)
         else:
-            box_features, refined_query_xyz = self.get_box_features(
+            (box_features, refined_query_xyz, initial_query_sizes,
+             _) = self.get_box_features(
                 vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples)
+                object_features, reference_uv, batch_data_samples,
+                reference_uv_layers)
 
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
             refined_query_xyz = [refined_query_xyz[-1]]
+            initial_query_sizes = [initial_query_sizes[-1]]
             layer_ids = [layer_ids[-1]]
 
         results = self.bbox_head.forward(
-            box_features, batch_inputs_dict, refined_query_xyz, layer_ids)
+            box_features, batch_inputs_dict, refined_query_xyz, layer_ids,
+            initial_query_sizes)
         return results
 
     @staticmethod
