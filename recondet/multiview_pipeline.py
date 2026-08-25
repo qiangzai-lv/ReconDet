@@ -669,6 +669,7 @@ class MultiViewPipeline_Tgt(BaseTransform):
         gt_depths = []
         denorm_imgs_list = []
         nerf_sizes = []
+        view_scale_factors = []
 
         if self.loading == 'random':
             ids = np.arange(len(results['img_info']))
@@ -722,6 +723,8 @@ class MultiViewPipeline_Tgt(BaseTransform):
             src_img_paths.append(results['img_info'][i]['filename'])
             _results = self.transforms(_results) # load and resize.
             imgs.append(_results['img']) # after resize, image is (239, 320, 3)            
+            view_scale_factors.append(
+                np.asarray(_results['scale_factor'], dtype=np.float32))
             # normalize
             for key in _results.get('img_fields', ['img']):
                 _results[key] = mmcv.imnormalize(_results[key], self.mean,
@@ -832,6 +835,7 @@ class MultiViewPipeline_Tgt(BaseTransform):
                 results[key] = _results[key]
         results['img'] = imgs # bug here.. imgs
         results['img_path'] = src_img_paths # manually add in img_path
+        results['view_scale_factors'] = view_scale_factors
 
         if 'ray_info' in results.keys():
             results['c2w'] = c2ws # only tgt view c2w!!

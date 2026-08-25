@@ -19,7 +19,6 @@ from vggt_omega.utils.pose_enc import encoding_to_camera
 
 device = get_device()
 
-
 class ChannelProjecter(nn.Module):
     def __init__(self, in_channels=2048, out_channels=256):
         super().__init__()
@@ -302,7 +301,8 @@ class ReconDet(Base3DDetector):
                 scaled_camera_extrinsics,
                 torch.linalg.inv(vggt_to_aligned)[:, None])
 
-        return aligned_points, aligned_extrinsics[..., :3, :]
+        return (aligned_points, aligned_extrinsics[..., :3, :],
+                vggt_to_aligned)
 
     @staticmethod
     def _robust_scene_diagonal(points):
@@ -404,7 +404,8 @@ class ReconDet(Base3DDetector):
                     point_map_by_unprojection_tensor, depth_map,
                     batch_data_samples)
                 batch_inputs_dict['scene_scale'] = scene_scale.detach()
-                point_map_by_unprojection_tensor, aligned_extrinsic = \
+                (point_map_by_unprojection_tensor, aligned_extrinsic,
+                 vggt_to_aligned) = \
                     self._align_vggt_reconstruction(
                         point_map_by_unprojection_tensor,
                         extrinsic,
@@ -429,7 +430,8 @@ class ReconDet(Base3DDetector):
 
                 return (sampled_point_map_by_unprojection_tensor.detach(),
                         aligned_extrinsic.detach(),
-                        intrinsic.detach())
+                        intrinsic.detach(),
+                        vggt_to_aligned.detach())
 
     def _build_patch_feature_maps(self, vggt_token_list, ps_idx,
                                   image_shape):
@@ -475,16 +477,21 @@ class ReconDet(Base3DDetector):
 
         feature_maps = self._build_patch_feature_maps(
             vggt_token_list, ps_idx, images.shape[-2:])
-        _, vggt_extrinsics, vggt_intrinsics = self.pred_pc_from_vggt(
-            vggt_token_list, ps_idx, images, batch_inputs_dict,
-            batch_data_samples)
+        (_, vggt_extrinsics, vggt_intrinsics,
+         vggt_to_aligned) = self.pred_pc_from_vggt(
+             vggt_token_list, ps_idx, images, batch_inputs_dict,
+             batch_data_samples)
         batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
         batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
+        batch_inputs_dict['vggt_to_aligned'] = vggt_to_aligned
 
         point_predictions = self.reconstruction_head(
             object_features, reference_uv,
             reference_uv_layers=reference_uv_layers)
-        query_xyz, initial_query_sizes, query_features, _ = \
+        point_predictions['vggt_to_aligned'] = vggt_to_aligned
+        point_predictions['aligned_to_vggt'] = torch.linalg.inv(
+            vggt_to_aligned)
+        query_xyz, query_features, _ = \
             self.reconstruction_head.reconstruct_boxes(point_predictions)
 
         batch_inputs_dict['query_xyz'] = query_xyz
@@ -500,7 +507,7 @@ class ReconDet(Base3DDetector):
             self.pos_embedding,
             self.query_projection,
             self.bbox_head.center_heads)
-        initial_sizes_per_layer = [initial_query_sizes] * len(box_features)
+        initial_sizes_per_layer = [None] * len(box_features)
         return (box_features, refined_query_xyz, initial_sizes_per_layer,
                 point_predictions)
 
@@ -550,13 +557,13 @@ class ReconDet(Base3DDetector):
         if self.if_mix_precision:
             with autocast(img.device):
                 (box_features, refined_query_xyz, initial_query_sizes,
-                 _) = self.get_box_features(
+                 point_predictions) = self.get_box_features(
                     vggt_token_list, ps_idx, batch_inputs_dict, img,
                     object_features, reference_uv, batch_data_samples,
                     reference_uv_layers)
         else:
             (box_features, refined_query_xyz, initial_query_sizes,
-             _) = self.get_box_features(
+             point_predictions) = self.get_box_features(
                 vggt_token_list, ps_idx, batch_inputs_dict, img,
                 object_features, reference_uv, batch_data_samples,
                 reference_uv_layers)
@@ -578,6 +585,11 @@ class ReconDet(Base3DDetector):
             **kwargs)
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
+        decoded_points = point_predictions['xyz'].detach()
+        for data_sample, points in zip(predictions, decoded_points):
+            data_sample.set_data({
+                'pred_reconstruction_points_3d': points
+            })
         return predictions
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
