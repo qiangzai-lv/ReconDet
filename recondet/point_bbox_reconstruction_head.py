@@ -130,14 +130,14 @@ class PointBBoxReconstructionHead(BaseModule):
                  torch.ones_like(point_xyz_vggt[..., :1])), dim=-1)
             point_xyz = torch.einsum(
                 'bij,bnj->bni', vggt_to_aligned,
-                point_homogeneous)[..., :3]
+                point_homogeneous)[..., :3].contiguous()
 
             seed_indices = self._foreground_weighted_fps(
                 point_xyz.detach(), foreground.detach(),
                 self.num_box_queries)
             batch_ids = torch.arange(
                 batch_size, device=point_features.device)[:, None]
-            seed_xyz = point_xyz[batch_ids, seed_indices]
+            seed_xyz = point_xyz[batch_ids, seed_indices].contiguous()
             seed_features = point_features[batch_ids, seed_indices]
 
             learned_queries = self.box_queries.weight[None].expand(
@@ -148,7 +148,7 @@ class PointBBoxReconstructionHead(BaseModule):
             feature_logits = torch.einsum(
                 'bqd,bnd->bqn', queries, keys) / math.sqrt(hidden_dim)
             spatial_distances = torch.cdist(
-                seed_xyz.float(), point_xyz.float()).square()
+                seed_xyz, point_xyz).square()
             assignment_logits = (
                 feature_logits -
                 spatial_distances / self.cluster_temperature)
