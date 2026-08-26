@@ -240,3 +240,5 @@ default_hooks = dict(
 )
 
 find_unused_parameters = True
+
+work_dir = './work_dirs/recondet_scannet_v3'
