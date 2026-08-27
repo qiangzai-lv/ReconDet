@@ -115,42 +115,15 @@ class ProjectedDeformableCrossAttention(nn.Module):
         return (view_weights[..., None] * attended).sum(dim=1)
 
 
-class StandardMultiheadCrossAttention(nn.Module):
-
-    def __init__(self, embed_dims, num_heads, dropout=0.0):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dims, num_heads, dropout=dropout, batch_first=True)
-
-    def forward(self, query, query_pos, feature_maps):
-        values = []
-        for feature_map in feature_maps:
-            batch_size, _, channels, _, _ = feature_map.shape
-            values.append(
-                feature_map.permute(0, 1, 3, 4, 2).reshape(
-                    batch_size, -1, channels))
-        value = torch.cat(values, dim=1).contiguous()
-        return self.attn(
-            query + query_pos, value, value, need_weights=False)[0]
-
-
 class GeometryAwareDecoderLayer(nn.Module):
 
     def __init__(self, embed_dims, num_heads, feedforward_channels,
-                 num_feature_levels, num_points,
-                 use_deformable_cross_attention, dropout=0.0):
+                 num_feature_levels, num_points, dropout=0.0):
         super().__init__()
-        self.use_deformable_cross_attention = \
-            use_deformable_cross_attention
         self.self_attn = nn.MultiheadAttention(
             embed_dims, num_heads, dropout=dropout, batch_first=True)
-        if use_deformable_cross_attention:
-            self.cross_attn = ProjectedDeformableCrossAttention(
-                embed_dims, num_heads, num_feature_levels, num_points,
-                dropout)
-        else:
-            self.cross_attn = StandardMultiheadCrossAttention(
-                embed_dims, num_heads, dropout)
+        self.cross_attn = ProjectedDeformableCrossAttention(
+            embed_dims, num_heads, num_feature_levels, num_points, dropout)
         self.linear1 = nn.Linear(embed_dims, feedforward_channels)
         self.linear2 = nn.Linear(feedforward_channels, embed_dims)
         self.norm1 = nn.LayerNorm(embed_dims)
@@ -168,13 +141,9 @@ class GeometryAwareDecoderLayer(nn.Module):
             need_weights=False)[0]
         query = query + self.dropout(self_attended)
 
-        if self.use_deformable_cross_attention:
-            cross_attended = self.cross_attn(
-                self.norm2(query), query_pos, feature_maps, reference_points,
-                view_mask)
-        else:
-            cross_attended = self.cross_attn(
-                self.norm2(query), query_pos, feature_maps)
+        cross_attended = self.cross_attn(
+            self.norm2(query), query_pos, feature_maps, reference_points,
+            view_mask)
         query = query + self.dropout(cross_attended)
 
         ffn = self.linear2(self.dropout(F.gelu(self.linear1(self.norm3(query)))))
@@ -185,28 +154,13 @@ class GeometryAwareDeformableDecoder(nn.Module):
 
     def __init__(self, embed_dims, num_layers, num_heads,
                  feedforward_channels, num_feature_levels, num_points=4,
-                 dropout=0.0, reference_update_layer_ids=None):
+                 dropout=0.0):
         super().__init__()
-        if reference_update_layer_ids is None:
-            reference_update_layer_ids = list(range(num_layers))
-        self.reference_update_layer_ids = sorted(
-            set(reference_update_layer_ids))
-        if not self.reference_update_layer_ids:
-            raise ValueError(
-                'reference_update_layer_ids must contain at least one layer')
-        if (self.reference_update_layer_ids[0] < 0 or
-                self.reference_update_layer_ids[-1] >= num_layers):
-            raise ValueError(
-                'reference_update_layer_ids must be within '
-                f'[0, {num_layers - 1}]')
-        reference_update_layer_id_set = set(
-            self.reference_update_layer_ids)
         self.layers = nn.ModuleList([
             GeometryAwareDecoderLayer(
                 embed_dims, num_heads, feedforward_channels,
-                num_feature_levels, num_points,
-                layer_id in reference_update_layer_id_set, dropout)
-            for layer_id in range(num_layers)
+                num_feature_levels, num_points, dropout)
+            for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(embed_dims)
 
@@ -224,28 +178,21 @@ class GeometryAwareDeformableDecoder(nn.Module):
                 reference_points, reference_min, reference_max)
             query_pos = query_projection(
                 position_embedding(query_xyz, input_range=None)).transpose(1, 2)
-            if layer_id in self.reference_update_layer_ids:
-                image_references, view_mask = project_queries_to_views(
-                    query_xyz, extrinsics, intrinsics, image_shape)
-            else:
-                image_references = None
-                view_mask = None
+            image_references, view_mask = project_queries_to_views(
+                query_xyz, extrinsics, intrinsics, image_shape)
             query = layer(
                 query, query_pos, feature_maps, image_references, view_mask)
             output = self.norm(query)
 
-            if layer_id in self.reference_update_layer_ids:
-                center_delta = center_branches[layer_id](
-                    output.transpose(1, 2)).transpose(1, 2)
-                new_reference_points = (
-                    inverse_sigmoid(reference_points) + center_delta).sigmoid()
-                refined_query_xyz = denormalize_reference_points(
-                    new_reference_points, reference_min, reference_max)
-                reference_points = new_reference_points.detach()
-            else:
-                refined_query_xyz = query_xyz
+            center_delta = center_branches[layer_id](
+                output.transpose(1, 2)).transpose(1, 2)
+            new_reference_points = (
+                inverse_sigmoid(reference_points) + center_delta).sigmoid()
+            refined_query_xyz = denormalize_reference_points(
+                new_reference_points, reference_min, reference_max)
 
             intermediate.append(output.transpose(1, 2))
             intermediate_references.append(refined_query_xyz)
+            reference_points = new_reference_points.detach()
 
         return intermediate, intermediate_references

@@ -66,7 +66,7 @@ model = dict(
         matcher='one2more',
         matcher_iou_thres=0.1,
         matcher_max_dynamic_samples=5,
-        loss_layer_ids=[1,3,5,7],
+        loss_layer_ids=list(range(_decoder_layer_num)),
         size_logit_range=(-10.0, 10.0)
     ),
     num_queries=256,
