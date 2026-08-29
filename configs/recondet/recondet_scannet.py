@@ -35,9 +35,7 @@ model = dict(
         dec_nlayers=_decoder_layer_num
     ),
     deformable_num_points=4,
-    gt_points_dir=f'{data_root}/points',
-    online_scale_point_stride=4,
-    online_scale_max_depth=30.0,
+    query_xyz_range=[-6.5, -9.0, -1.0, 6.5, 9.0, 4.5],
     bbox_head=dict(
         type='ReconDetHead',
         n_classes=18,
@@ -73,9 +71,6 @@ model = dict(
     token_dim=_token_dim_,
     test_only_last_layer=True,
     if_mix_precision=True,
-    use_multi_layers=True,
-    if_simpler_project=True,
-    if_use_pred_pc_query=True,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
 )
