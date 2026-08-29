@@ -12,37 +12,7 @@ from mmdet3d.structures import DepthInstance3DBoxes
 
 @DATASETS.register_module()
 class MultiViewScanNetDataset(Det3DDataset):
-    r"""Multi-View ScanNet Dataset for NeRF-detection Task
 
-    This class serves as the API for experiments on the ScanNet Dataset.
-
-    Please refer to the `github repo <https://github.com/ScanNet/ScanNet>`_
-    for data downloading.
-
-    Args:
-        data_root (str): Path of dataset root.
-        ann_file (str): Path of annotation file.
-        metainfo (dict, optional): Meta information for dataset, such as class
-            information. Defaults to None.
-        pipeline (List[dict]): Pipeline used for data processing.
-            Defaults to [].
-        modality (dict): Modality to specify the sensor data used as input.
-            Defaults to dict(use_camera=True, use_lidar=False).
-        box_type_3d (str): Type of 3D box of this dataset.
-            Based on the `box_type_3d`, the dataset will encapsulate the box
-            to its original format then converted them to `box_type_3d`.
-            Defaults to 'Depth' in this dataset. Available options includes:
-
-            - 'LiDAR': Box in LiDAR coordinates.
-            - 'Depth': Box in depth coordinates, usually for indoor dataset.
-            - 'Camera': Box in camera coordinates.
-        filter_empty_gt (bool): Whether to filter the data with empty GT.
-            If it's set to be True, the example with empty annotations after
-            data pipeline will be dropped and a random example will be chosen
-            in `__getitem__`. Defaults to True.
-        test_mode (bool): Whether the dataset is in test mode.
-            Defaults to False.
-    """
     METAINFO = {
         'classes':
         ('cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window',
