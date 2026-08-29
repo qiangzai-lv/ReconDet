@@ -107,22 +107,13 @@ input_modality = dict(
 train_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
-        type='MultiViewPipeline_Tgt',
+        type='MultiViewPipeline',
         n_images=42,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ],
-        mean=[123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375],
-        margin=10,
-        depth_range=[0.5, 5.5],  # for what purpose?
-        loading='gap',
-        nerf_target_views=2,
-        tgt_transforms=[
-            dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
-            dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
-        ]
+        loading='random'
     ),
     dict(type='LoadFirstFramePose'),
     dict(type='PackNeRFDetInputs', keys=train_collect_keys)
@@ -131,22 +122,13 @@ train_pipeline = [
 test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
-        type='MultiViewPipeline_Tgt',
+        type='MultiViewPipeline',
         n_images=81,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ],
-        mean=[123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375],
-        margin=10,
-        depth_range=[0.5, 5.5],
-        loading='random',
-        nerf_target_views=1,
-        tgt_transforms=[
-            dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
-            dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
-        ]
+        loading='uniform'
     ),
     dict(type='LoadFirstFramePose'),
     dict(type='PackNeRFDetInputs', keys=test_collect_keys)

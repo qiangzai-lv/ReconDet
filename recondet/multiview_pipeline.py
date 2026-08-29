@@ -1,9 +1,7 @@
 from pathlib import Path
 
-import mmcv
 import numpy as np
 from mmcv.transforms import BaseTransform, Compose
-from PIL import Image
 
 from mmdet3d.registry import TRANSFORMS
 
@@ -49,110 +47,59 @@ class LoadFirstFramePose(BaseTransform):
 
 
 @TRANSFORMS.register_module()
-class MultiViewPipeline_Tgt(BaseTransform):
+class MultiViewPipeline(BaseTransform):
 
     def __init__(self,
                  transforms: dict,
                  n_images: int,
-                 mean: tuple = [123.675, 116.28, 103.53],
-                 std: tuple = [58.395, 57.12, 57.375],
-                 margin: int = 10,
-                 depth_range: tuple = [0.5, 5.5],
-                 loading: str = 'random',
-                 nerf_target_views: int = 0,
-                 sample_freq: int = 3,
-                 tgt_transforms=None):
+                 loading: str = 'random'):
+        if n_images <= 0:
+            raise ValueError('n_images must be positive')
+        if loading not in ('random', 'uniform'):
+            raise ValueError(
+                f'Unsupported view loading strategy: {loading}')
+
         self.transforms = Compose(transforms)
-        self.depth_transforms = Compose(transforms[1])
         self.n_images = n_images
-        self.mean = np.array(mean, dtype=np.float32)
-        self.std = np.array(std, dtype=np.float32)
-        self.margin = margin
-        self.depth_range = depth_range
         self.loading = loading
-        self.sample_freq = sample_freq
-        self.nerf_target_views = nerf_target_views
-        self.tgt_transforms = Compose(tgt_transforms)
 
-    def transform(self, results: dict) -> dict:
-
-        imgs = []
-        depths = []
-        extrinsics = []
+    def _select_view_indices(self, num_views: int) -> np.ndarray:
+        if num_views <= 0:
+            raise ValueError('A scene must contain at least one image')
 
         if self.loading == 'random':
-            ids = np.arange(len(results['img_info']))
-            replace = True if self.n_images > len(ids) else False
-            ids = np.random.choice(ids, self.n_images, replace=replace)
-            if self.nerf_target_views != 0:
-                target_id = np.random.choice(
-                    ids, self.nerf_target_views, replace=False)
-                ids = np.setdiff1d(ids, target_id)
-                ids = ids.tolist()
+            return np.random.choice(
+                num_views,
+                self.n_images,
+                replace=self.n_images > num_views)
 
-        elif self.loading == 'gap':
-            ids = np.arange(len(results['img_info']))
-            src_1 = np.random.randint(0, len(ids) // 2 - self.nerf_target_views // 2 - 1, (1,))[
-                0]  # choose one from first half of images
-            src_3 = np.random.randint(len(ids) // 2, len(ids) - self.nerf_target_views // 2 - 1, (1,))[0]
-            src_used_id = [src_1, src_1 + self.nerf_target_views // 2 + 1, src_3,
-                           src_3 + self.nerf_target_views // 2 + 1]
-            target_id = []
-            for k in range(self.nerf_target_views // 2):
-                target_id = target_id + [src_1 + 1 + k, src_3 + 1 + k]
-            used_id = src_used_id + target_id
-            replace = True if self.n_images > len(ids) else False
-            rest_src = np.random.choice(np.setdiff1d(ids, np.array(used_id)), self.n_images - len(used_id),
-                                        replace=replace)
-            ids = rest_src.tolist() + src_used_id
-            assert max(ids) < len(results['img_info'])
+        return np.rint(
+            np.linspace(0, num_views - 1, self.n_images)).astype(np.int64)
 
-        else:
-            assert ""
-
-        size = (240, 320)
+    def transform(self, results: dict) -> dict:
+        ids = self._select_view_indices(len(results['img_info']))
+        imgs = []
+        extrinsics = []
         src_img_paths = []
+        frame_metadata = {}
         for i in ids:
-            _results = dict()
-            _results['img_path'] = results['img_info'][i]['filename']
-            src_img_paths.append(results['img_info'][i]['filename'])
-            _results = self.transforms(_results)  # load and resize.
-            imgs.append(_results['img'])  # after resize, image is (239, 320, 3)
-            # normalize
-            for key in _results.get('img_fields', ['img']):
-                _results[key] = mmcv.imnormalize(_results[key], self.mean,
-                                                 self.std, True)  # to_rgb=True
-            _results['img_norm_cfg'] = dict(
-                mean=self.mean, std=self.std, to_rgb=True)
-            # pad
-            for key in _results.get('img_fields', ['img']):
-                padded_img = mmcv.impad(_results[key], shape=size, pad_val=0)
-                _results[key] = padded_img
-            _results['pad_shape'] = padded_img.shape  # (240, 320, 3)
-            _results['pad_fixed_size'] = size  # (240, 320)
-            ori_shape = _results['ori_shape']  # (968, 1296)
-            aft_shape = _results['img_shape']  # (239, 320)
-            # prepare the depth information
-            if 'depth_info' in results.keys():
-                if '.npy' in results['depth_info'][i]['filename']:
-                    _results['depth'] = np.load(
-                        results['depth_info'][i]['filename'])
-                else:
-                    _results['depth'] = np.asarray((Image.open(
-                        results['depth_info'][i]['filename']))) / 1000
-                    _results['depth'] = mmcv.imresize(
-                        _results['depth'], (aft_shape[1], aft_shape[0]))
-                depths.append(_results['depth'])
+            view_index = int(i)
+            img_path = results['img_info'][view_index]['filename']
+            frame_results = self.transforms(dict(img_path=img_path))
+            if frame_results is None:
+                raise RuntimeError(f'Failed to load image: {img_path}')
 
-            extrinsics.append(results['lidar2img']['extrinsic'][i])
+            imgs.append(frame_results['img'])
+            src_img_paths.append(img_path)
+            extrinsics.append(
+                results['lidar2img']['extrinsic'][view_index])
+            frame_metadata = {
+                key: value for key, value in frame_results.items()
+                if key not in ('img', 'img_info', 'img_path')
+            }
 
-        for key in _results.keys():
-            if key not in ['img', 'img_info']:
-                results[key] = _results[key]
-        results['img'] = imgs  # bug here.. imgs
-        results['img_path'] = src_img_paths  # manually add in img_path
-
-        if len(depths) != 0:
-            results['depth'] = depths
-        results['lidar2img']['extrinsic'] = extrinsics  # w2c src view.
+        results.update(frame_metadata)
+        results['img'] = imgs
+        results['img_path'] = src_img_paths
+        results['lidar2img']['extrinsic'] = extrinsics
         return results
