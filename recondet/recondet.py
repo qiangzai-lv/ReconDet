@@ -37,9 +37,9 @@ class ReconDet(Base3DDetector):
             grounding_dino_config=None,
             grounding_dino_checkpoint=None,
             semantic_classes=(),
-            grounding_dino_view_chunk_size=1,
             grounding_dino_print_score_thr=0.3,
             grounding_dino_visualization_dir=None,
+            grounding_dino_visualization_interval=100,
             deformable_num_points=4,
             query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
     ):
@@ -60,9 +60,9 @@ class ReconDet(Base3DDetector):
                 config=grounding_dino_config,
                 checkpoint=grounding_dino_checkpoint,
                 classes=semantic_classes,
-                view_chunk_size=grounding_dino_view_chunk_size,
                 print_score_thr=grounding_dino_print_score_thr,
-                visualization_dir=grounding_dino_visualization_dir)
+                visualization_dir=grounding_dino_visualization_dir,
+                visualization_interval=grounding_dino_visualization_interval)
 
         self.vggt_encoder = VGGTOmega()
         self.vggt_encoder.load_state_dict(
@@ -234,6 +234,8 @@ class ReconDet(Base3DDetector):
         if self.semantic_encoder is not None:
             semantic_losses = self.semantic_encoder.loss(
                 batch_inputs_dict['imgs'], batch_data_samples)
+            return {f'gdino_{name}': value
+                    for name, value in semantic_losses.items()}
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')

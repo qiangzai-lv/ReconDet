@@ -32,10 +32,10 @@ model = dict(
     grounding_dino_config=grounding_dino_config,
     grounding_dino_checkpoint=grounding_dino_checkpoint,
     semantic_classes=grounding_dino_classes,
-    grounding_dino_view_chunk_size=42,
     grounding_dino_print_score_thr=0.3,
     grounding_dino_visualization_dir=(
         'work_dirs/recondet_scannet/grounding_dino_vis'),
+    grounding_dino_visualization_interval=100,
     data_preprocessor=dict(
         type='VGGTDetDataPreprocessor',
         bgr_to_rgb=True,
