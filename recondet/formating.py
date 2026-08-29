@@ -328,6 +328,10 @@ class PackNeRFDetInputs(BaseTransform):
                                               f'corresponding field')
 
         data_sample.gt_instances_3d = gt_instances_3d
+        for key in ('keypoints_3d', 'keypoints_2d', 'keypoints_visible',
+                    'bboxes_2d', 'bboxes_2d_visible'):
+            if key in gt_instances_3d:
+                gt_instances[key] = gt_instances_3d[key]
         data_sample.gt_instances = gt_instances
         data_sample.gt_pts_seg = gt_pts_seg
         data_sample.gt_nerf_images = gt_nerf_images

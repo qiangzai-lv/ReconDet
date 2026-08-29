@@ -14,6 +14,7 @@ from torch.nn import functional as F
 
 from mmdet3d.models.data_preprocessors.utils import multiview_img_stack_batch
 from mmdet3d.registry import MODELS
+from recondet.keypoint_projection import BBoxKeypointProjector
 
 
 @MODELS.register_module()
@@ -49,6 +50,8 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
             non_blocking=non_blocking,
             batch_augments=batch_augments)
         self.batch_first = batch_first
+        self.bbox_keypoint_projector = BBoxKeypointProjector()
+
 
     def forward(self,
                 data: Union[dict, List[dict]],
@@ -69,9 +72,9 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
     def simple_process(self, data: dict, training: bool = False) -> dict:
 
         if 'img' in data['inputs']:
-            batch_pad_shape = self._get_pad_shape(data)
+            batch_pad_shape = self._get_pad_shape(data) # [(240, 320)]
 
-        data = self.collate_data(data)  # after collate. inputs['imgs]=(bs, 40, 3, h, w). bgr2rgb, normalized
+        data = self.collate_data(data) # after collate. inputs['imgs]=(bs, 40, 3, h, w). bgr2rgb, normalized
         inputs, data_samples = data['inputs'], data['data_samples']
         batch_inputs = dict()
 
@@ -82,14 +85,32 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
             imgs = inputs['imgs']
 
             if data_samples is not None:
-
-                batch_input_shape = tuple(imgs[0].size()[-2:])  # (240, 320)
+                batch_input_shape = tuple(imgs[0].size()[-2:]) # (240, 320)
                 for data_sample, pad_shape in zip(data_samples,
                                                   batch_pad_shape):
                     data_sample.set_metainfo({
                         'batch_input_shape': batch_input_shape,
                         'pad_shape': pad_shape
-                    })  # didn't use this info
+                    }) # didn't use this info
+
+                    instances = data_sample.gt_instances_3d
+                    if 'bboxes_3d' not in instances:
+                        continue
+                    boxes = instances.bboxes_3d
+                    metadata = data_sample.metainfo
+                    keypoints = self.bbox_keypoint_projector(
+                        centers=boxes.gravity_center,
+                        dimensions=boxes.dims,
+                        extrinsics=metadata['lidar2img']['extrinsic'],
+                        intrinsic=metadata['lidar2img']['intrinsic'],
+                        scale_factor=metadata['scale_factor'],
+                        image_shape=batch_input_shape,
+                        valid_image_shape=metadata['img_shape'])
+                    instances.keypoints_3d = keypoints[0]
+                    instances.keypoints_2d = keypoints[1]
+                    instances.keypoints_visible = keypoints[2]
+                    instances.bboxes_2d = keypoints[3]
+                    instances.bboxes_2d_visible = keypoints[4]
 
                 if self.boxtype2tensor:
                     samplelist_boxtype2tensor(data_samples)
@@ -98,10 +119,10 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                 if self.pad_seg:
                     self.pad_gt_sem_seg(data_samples)
 
-            if training and self.batch_augments is not None:  # no?
+            if training and self.batch_augments is not None: # no?
                 for batch_aug in self.batch_augments:
                     imgs, data_samples = batch_aug(imgs, data_samples)
-            batch_inputs['imgs'] = imgs  #
+            batch_inputs['imgs'] = imgs # 
 
         if 'depth' in inputs.keys():
             batch_inputs['depth'] = inputs['depth']
@@ -144,7 +165,7 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                     elif img_dim == 4:
                         _batch_img = [
                             self.preprocess_img(_img) for _img in _batch_img
-                        ]  # bgr_2_rgb, normalize.
+                        ] # bgr_2_rgb, normalize.
 
                         _batch_img = torch.stack(_batch_img, dim=0)
 
@@ -185,7 +206,11 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                     'or a tuple with inputs and data_samples, but got '
                     f'{type(data)}: {data}')
 
-            data['inputs']['imgs'] = batch_imgs  # (bs, 40, 3, 240, 320). bgr2rgb, normalized
+            data['inputs']['imgs'] = batch_imgs # (bs, 40, 3, 240, 320). bgr2rgb, normalized
+        if 'raydirs' in data['inputs']:
+            _batch_dirs = data['inputs']['raydirs']
+            batch_dirs = stack_batch(_batch_dirs)
+            data['inputs']['raydirs'] = batch_dirs
 
         data.setdefault('data_samples', None)
 

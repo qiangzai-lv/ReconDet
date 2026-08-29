@@ -10,6 +10,7 @@ from mmdet.utils import register_all_modules
 from mmengine.config import Config
 from mmengine.dist import is_main_process
 from mmengine.runner import load_checkpoint
+from mmengine.structures import InstanceData
 from torch import nn
 
 
@@ -48,6 +49,9 @@ class GroundingDINOSemanticEncoder(nn.Module):
 
         for parameter in self.model.parameters():
             parameter.requires_grad = False
+        for module in (self.model.decoder, self.model.bbox_head):
+            for parameter in module.parameters():
+                parameter.requires_grad = True
         self.model.eval()
 
         self.classes = tuple(classes)
@@ -67,8 +71,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
             persistent=False)
 
     def train(self, mode: bool = True):
-        super().train(False)
-        self.model.eval()
+        super().train(mode)
+        for module_name in ('backbone', 'neck', 'encoder', 'language_model'):
+            module = getattr(self.model, module_name, None)
+            if module is not None:
+                module.eval()
         return self
 
     @staticmethod
@@ -169,6 +176,80 @@ class GroundingDINOSemanticEncoder(nn.Module):
             f'batch_{batch_index:02d}_view_{view_index:03d}.jpg')
         if not cv2.imwrite(str(output_path), bgr_image):
             raise IOError(f'Failed to save visualization to {output_path}.')
+
+    def _make_training_samples(self, batch_data_samples, num_views,
+                               padded_shape, view_start=0, view_end=None):
+        image_height, image_width = padded_shape
+        if view_end is None:
+            view_end = num_views
+        samples = []
+        for source_sample in batch_data_samples:
+            source_instances = source_sample.gt_instances_3d
+            # 3D ScanNet annotations use ``labels_3d``. GroundingDINO's
+            # per-view samples require the generic 2D ``labels`` field.
+            source_labels = getattr(source_instances, 'labels_3d', None)
+            if source_labels is None:
+                source_labels = getattr(source_instances, 'labels', None)
+            if source_labels is None:
+                boxes_3d = getattr(source_instances, 'bboxes_3d', None)
+                num_boxes = len(boxes_3d) if boxes_3d is not None else 0
+                label_device = getattr(boxes_3d, 'device', None)
+                if label_device is None:
+                    label_device = getattr(boxes_3d, 'tensor', None)
+                    label_device = getattr(label_device, 'device', None)
+                source_labels = torch.zeros(
+                    (num_boxes,), dtype=torch.long,
+                    device=label_device)
+            num_instances = len(source_labels)
+            for view_index in range(view_start, view_end):
+                sample = self._make_data_sample(
+                    source_sample, view_index, padded_shape)
+                instances = InstanceData()
+                instances.labels = source_labels.clone()
+                bboxes = source_instances.bboxes_2d
+                if bboxes.ndim == 3:
+                    bboxes = bboxes[:, view_index]
+                instances.bboxes_2d = bboxes
+                instances.bboxes = bboxes * bboxes.new_tensor(
+                    [image_width, image_height, image_width, image_height])
+                keypoints = source_instances.keypoints_2d
+                visible = source_instances.keypoints_visible
+                if keypoints.ndim == 4:
+                    keypoints = keypoints[:, view_index]
+                    visible = visible[:, view_index]
+                instances.keypoints_2d = keypoints
+                instances.keypoints_visible = visible
+                if num_instances == 0:
+                    instances.bboxes = instances.bboxes.reshape(0, 4)
+                    instances.labels = instances.labels.reshape(0)
+                sample.gt_instances = instances
+                samples.append(sample)
+        return samples
+
+    def loss(self, images, batch_data_samples):
+        batch_size, num_views = images.shape[:2]
+        padded_shape = images.shape[-2:]
+        total_views = num_views
+        losses = {}
+        for view_start in range(0, num_views, self.view_chunk_size):
+            view_end = min(view_start + self.view_chunk_size, num_views)
+            chunk_images = images[:, view_start:view_end]
+            chunk_views = view_end - view_start
+            normalized = self._normalize_images(
+                chunk_images, batch_data_samples)
+            samples = self._make_training_samples(
+                batch_data_samples, num_views, padded_shape,
+                view_start=view_start, view_end=view_end)
+            chunk_losses = self.model.loss(
+                normalized, samples, freeze_feature_extractor=True)
+            weight = chunk_views / total_views
+            for name, value in chunk_losses.items():
+                weighted_value = value * weight
+                if name in losses:
+                    losses[name] = losses[name] + weighted_value
+                else:
+                    losses[name] = weighted_value
+        return losses
 
     @torch.no_grad()
     def predict_and_print(self, images, batch_data_samples) -> None:

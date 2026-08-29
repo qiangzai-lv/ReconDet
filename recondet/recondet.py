@@ -232,7 +232,7 @@ class ReconDet(Base3DDetector):
              **kwargs) -> Union[dict, list]:
 
         if self.semantic_encoder is not None:
-            self.semantic_encoder.predict_and_print(
+            semantic_losses = self.semantic_encoder.loss(
                 batch_inputs_dict['imgs'], batch_data_samples)
 
         vggt_token_list, ps_idx, img = self.extract_feat(
@@ -254,6 +254,9 @@ class ReconDet(Base3DDetector):
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
             **kwargs)
+        if self.semantic_encoder is not None:
+            losses.update({f'gdino_{name}': value
+                           for name, value in semantic_losses.items()})
         return losses
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,

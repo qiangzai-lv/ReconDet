@@ -11,7 +11,7 @@ lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
 model = dict(
     type='mmdet.GroundingDINO',
-    num_queries=900,
+    num_queries=64,
     with_box_refine=True,
     as_two_stage=True,
     data_preprocessor=dict(
@@ -97,6 +97,8 @@ model = dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
         type='mmdet.GroundingDINOHead',
+        center_loss_weight=1.0,
+        keypoint_loss_weight=1.0,
         num_classes=256,
         sync_cls_avg_factor=True,
         contrastive_cfg=dict(max_text_len=256, log_scale='auto', bias=True),
