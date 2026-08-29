@@ -11,6 +11,7 @@ from recondet.detr3_models.helpers import GenericMLP
 from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
 from recondet.geometry_attention import GeometryAwareDeformableDecoder
+from recondet.grounding_dino_encoder import GroundingDINOSemanticEncoder
 from vggt_omega.models import VGGTOmega
 
 device = get_device()
@@ -33,6 +34,12 @@ class ReconDet(Base3DDetector):
             if_mix_precision=False,
             if_save_vggt_feature=False,
             vggt_omega_checkpoint=None,
+            grounding_dino_config=None,
+            grounding_dino_checkpoint=None,
+            semantic_classes=(),
+            grounding_dino_view_chunk_size=1,
+            grounding_dino_print_score_thr=0.3,
+            grounding_dino_visualization_dir=None,
             deformable_num_points=4,
             query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
     ):
@@ -42,6 +49,20 @@ class ReconDet(Base3DDetector):
         bbox_head.update(train_cfg=train_cfg)
         bbox_head.update(test_cfg=test_cfg)
         self.bbox_head = MODELS.build(bbox_head)
+
+        self.semantic_encoder = None
+        if grounding_dino_config is not None:
+            if grounding_dino_checkpoint is None:
+                raise ValueError(
+                    'grounding_dino_checkpoint is required when '
+                    'grounding_dino_config is set.')
+            self.semantic_encoder = GroundingDINOSemanticEncoder(
+                config=grounding_dino_config,
+                checkpoint=grounding_dino_checkpoint,
+                classes=semantic_classes,
+                view_chunk_size=grounding_dino_view_chunk_size,
+                print_score_thr=grounding_dino_print_score_thr,
+                visualization_dir=grounding_dino_visualization_dir)
 
         self.vggt_encoder = VGGTOmega()
         self.vggt_encoder.load_state_dict(
@@ -209,6 +230,10 @@ class ReconDet(Base3DDetector):
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
+
+        if self.semantic_encoder is not None:
+            self.semantic_encoder.predict_and_print(
+                batch_inputs_dict['imgs'], batch_data_samples)
 
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')

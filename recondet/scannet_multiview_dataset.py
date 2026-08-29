@@ -51,14 +51,7 @@ class MultiViewScanNetDataset(Det3DDataset):
 
     @staticmethod
     def _get_axis_align_matrix(info: dict) -> np.ndarray:
-        """Get axis_align_matrix from info. If not exist, return identity mat.
 
-        Args:
-            info (dict): Info of a single sample data.
-
-        Returns:
-            np.ndarray: 4x4 transformation matrix.
-        """
         if 'axis_align_matrix' in info:
             return np.array(info['axis_align_matrix'])
         else:
@@ -68,18 +61,7 @@ class MultiViewScanNetDataset(Det3DDataset):
             return np.eye(4).astype(np.float32)
 
     def parse_data_info(self, info: dict) -> dict:
-        """Process the raw data info.
 
-        Convert all relative path of needed modality data file to
-        the absolute path.
-
-        Args:
-            info (dict): Raw info dict.
-
-        Returns:
-            dict: Has `ann_info` in training stage. And
-            all path has been converted to absolute path.
-        """
         if self.modality['use_depth']:
             info['depth_info'] = []
         if self.modality['use_neuralrecon_depth']:
@@ -138,14 +120,7 @@ class MultiViewScanNetDataset(Det3DDataset):
         return info
 
     def parse_ann_info(self, info: dict) -> dict:
-        """Process the `instances` in data info to `ann_info`.
 
-        Args:
-            info (dict): Info dict.
-
-        Returns:
-            dict: Processed `ann_info`.
-        """
         ann_info = super().parse_ann_info(info)
 
         if self.remove_dontcare:
@@ -257,9 +232,6 @@ class MultiViewARKitDataset(Det3DDataset):
         info['axis_align_matrix'] = self._get_axis_align_matrix(info)
         info['img_info'] = []
         info['lidar2img'] = []
-        info['c2w'] = []
-        info['camrotc2w'] = []
-        info['lightpos'] = []
         intrinsics = []
         # load img and depth_img
         for i in range(len(info['img_paths'])):
@@ -285,21 +257,11 @@ class MultiViewARKitDataset(Det3DDataset):
             intrinsics.append(new_intrinsic.astype(np.float32))
             
             
-            if self.modality['use_ray']:
-                c2w = (
-                    info['axis_align_matrix'] @ info['lidar2cam'][i]).astype(
-                        np.float32)  # noqa
-                info['c2w'].append(c2w)
-                info['camrotc2w'].append(c2w[0:3, 0:3])
-                info['lightpos'].append(c2w[0:3, 3])
         origin = np.array([.0, .0, .5])
         info['lidar2img'] = dict(
             extrinsic=info['lidar2img'],
             intrinsic=intrinsics,
             origin=origin.astype(np.float32))
-
-        if self.modality['use_ray']:
-            info['ray_info'] = []
 
         if not self.test_mode:
             info['ann_info'] = self.parse_ann_info(info)

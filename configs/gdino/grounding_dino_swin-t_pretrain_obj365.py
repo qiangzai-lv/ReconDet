@@ -3,35 +3,37 @@ _base_ = [
     '../mmdet_base_/schedules/schedule_1x.py', '../mmdet_base_/default_runtime.py'
 ]
 
-load_from = 'https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
+load_from = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 
 
 pretrained = 'https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth'  # noqa
 lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
 model = dict(
-    type='GroundingDINO',
+    type='mmdet.GroundingDINO',
     num_queries=900,
     with_box_refine=True,
     as_two_stage=True,
     data_preprocessor=dict(
-        type='DetDataPreprocessor',
+        type='mmdet.DetDataPreprocessor',
         mean=[123.675, 116.28, 103.53],
         std=[58.395, 57.12, 57.375],
         bgr_to_rgb=True,
         pad_mask=False,
     ),
     language_model=dict(
-        type='BertModel',
+        type='mmdet.BertModel',
         name=lang_model_name,
         max_tokens=256,
         pad_to_max=False,
         use_sub_sentence_represent=True,
         special_tokens_list=['[CLS]', '[SEP]', '.', '?'],
         add_pooling_layer=False,
+        enable_cache=True,
+        cache_size=1,
     ),
     backbone=dict(
-        type='SwinTransformer',
+        type='mmdet.SwinTransformer',
         embed_dims=96,
         depths=[2, 2, 6, 2],
         num_heads=[3, 6, 12, 24],
@@ -49,7 +51,7 @@ model = dict(
         frozen_stages=-1,
         init_cfg=dict(type='Pretrained', checkpoint=pretrained)),
     neck=dict(
-        type='ChannelMapper',
+        type='mmdet.ChannelMapper',
         in_channels=[192, 384, 768],
         kernel_size=1,
         out_channels=256,
@@ -94,17 +96,17 @@ model = dict(
     positional_encoding=dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
-        type='GroundingDINOHead',
+        type='mmdet.GroundingDINOHead',
         num_classes=256,
         sync_cls_avg_factor=True,
         contrastive_cfg=dict(max_text_len=256, log_scale='auto', bias=True),
         loss_cls=dict(
-            type='FocalLoss',
+            type='mmdet.FocalLoss',
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
             loss_weight=1.0),  # 2.0 in DeformDETR
-        loss_bbox=dict(type='L1Loss', loss_weight=5.0)),
+        loss_bbox=dict(type='mmdet.L1Loss', loss_weight=5.0)),
     dn_cfg=dict(  # TODO: Move to model.train_cfg ?
         label_noise_scale=0.5,
         box_noise_scale=1.0,  # 0.4 for DN-DETR
@@ -113,11 +115,11 @@ model = dict(
     # training and testing settings
     train_cfg=dict(
         assigner=dict(
-            type='HungarianAssigner',
+            type='mmdet.HungarianAssigner',
             match_costs=[
-                dict(type='BinaryFocalLossCost', weight=2.0),
-                dict(type='BBoxL1Cost', weight=5.0, box_format='xywh'),
-                dict(type='IoUCost', iou_mode='giou', weight=2.0)
+                dict(type='mmdet.BinaryFocalLossCost', weight=2.0),
+                dict(type='mmdet.BBoxL1Cost', weight=5.0, box_format='xywh'),
+                dict(type='mmdet.IoUCost', iou_mode='giou', weight=2.0)
             ])),
     test_cfg=dict(max_per_img=300))
 
@@ -187,7 +189,7 @@ test_pipeline = [
                    'tokens_positive'))
 ]
 
-dataset_type = 'ODVGDataset'
+dataset_type = 'mmdet.ODVGDataset'
 data_root = 'data/objects365v1/'
 
 coco_od_dataset = dict(

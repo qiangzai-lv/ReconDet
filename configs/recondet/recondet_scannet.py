@@ -12,6 +12,13 @@ resume = False
 
 data_root = '/root/shared-nvme/data/ScanNet_processed'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
+grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
+grounding_dino_checkpoint = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'
+grounding_dino_classes = [
+    'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
+    'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
+    'toilet', 'sink', 'bathtub', 'garbage bin'
+]
 
 custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 
@@ -22,6 +29,13 @@ _decoder_layer_num = 8
 model = dict(
     type='ReconDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
+    grounding_dino_config=grounding_dino_config,
+    grounding_dino_checkpoint=grounding_dino_checkpoint,
+    semantic_classes=grounding_dino_classes,
+    grounding_dino_view_chunk_size=42,
+    grounding_dino_print_score_thr=0.3,
+    grounding_dino_visualization_dir=(
+        'work_dirs/recondet_scannet/grounding_dino_vis'),
     data_preprocessor=dict(
         type='VGGTDetDataPreprocessor',
         bgr_to_rgb=True,

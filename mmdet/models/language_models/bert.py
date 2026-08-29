@@ -94,6 +94,10 @@ class BertModel(BaseModel):
             the embedded model. Defaults to 1.
         use_checkpoint (bool, optional): whether to use gradient checkpointing.
              Defaults to False.
+        enable_cache (bool, optional): whether to cache frozen text features
+            during evaluation. Defaults to False.
+        cache_size (int, optional): maximum number of unique caption batches
+            retained in the cache. Defaults to 16.
     """
 
     def __init__(self,
@@ -105,11 +109,18 @@ class BertModel(BaseModel):
                  add_pooling_layer: bool = False,
                  num_layers_of_embedded: int = 1,
                  use_checkpoint: bool = False,
+                 enable_cache: bool = False,
+                 cache_size: int = 16,
                  **kwargs) -> None:
 
         super().__init__(**kwargs)
         self.max_tokens = max_tokens
         self.pad_to_max = pad_to_max
+        if cache_size < 1:
+            raise ValueError('cache_size must be at least 1.')
+        self.enable_cache = enable_cache
+        self.cache_size = cache_size
+        self._text_feature_cache = OrderedDict()
 
         if AutoTokenizer is None:
             raise RuntimeError(
@@ -134,8 +145,19 @@ class BertModel(BaseModel):
             self.special_tokens = self.tokenizer.convert_tokens_to_ids(
                 special_tokens_list)
 
-    def forward(self, captions: Sequence[str], **kwargs) -> dict:
-        """Forward function."""
+    def clear_cache(self) -> None:
+        self._text_feature_cache.clear()
+
+    def train(self, mode: bool = True):
+        if mode:
+            self.clear_cache()
+        return super().train(mode)
+
+    def _apply(self, fn):
+        self.clear_cache()
+        return super()._apply(fn)
+
+    def _forward_uncached(self, captions: Sequence[str]) -> dict:
         device = next(self.language_backbone.parameters()).device
         tokenized = self.tokenizer.batch_encode_plus(
             captions,
@@ -168,6 +190,59 @@ class BertModel(BaseModel):
             language_dict_features[
                 'text_token_mask'] = tokenized.attention_mask.bool()
         return language_dict_features
+
+    @staticmethod
+    def _deduplicate_captions(captions):
+        unique_captions = []
+        caption_indices = {}
+        inverse_indices = []
+        for caption in captions:
+            if caption not in caption_indices:
+                caption_indices[caption] = len(unique_captions)
+                unique_captions.append(caption)
+            inverse_indices.append(caption_indices[caption])
+        return unique_captions, inverse_indices
+
+    @staticmethod
+    def _expand_cached_features(features, inverse_indices):
+        reference = next(
+            value for value in features.values()
+            if isinstance(value, torch.Tensor))
+        indices = torch.as_tensor(
+            inverse_indices, device=reference.device, dtype=torch.long)
+        unique_count = reference.shape[0]
+        return {
+            name: value.index_select(0, indices)
+            if (isinstance(value, torch.Tensor) and value.ndim > 0 and
+                value.shape[0] == unique_count) else value
+            for name, value in features.items()
+        }
+
+    def forward(self, captions: Sequence[str], **kwargs) -> dict:
+        """Encode captions, reusing frozen features for repeated text."""
+        use_cache = (self.enable_cache and not self.training and
+                     not torch.is_grad_enabled())
+        if not use_cache:
+            return self._forward_uncached(captions)
+
+        unique_captions, inverse_indices = self._deduplicate_captions(captions)
+        cache_key = tuple(unique_captions)
+        language_dict_features = self._text_feature_cache.get(cache_key)
+        if language_dict_features is None:
+            language_dict_features = self._forward_uncached(unique_captions)
+            language_dict_features = {
+                name: value.detach() if isinstance(value, torch.Tensor)
+                else value
+                for name, value in language_dict_features.items()
+            }
+            self._text_feature_cache[cache_key] = language_dict_features
+            while len(self._text_feature_cache) > self.cache_size:
+                self._text_feature_cache.popitem(last=False)
+        else:
+            self._text_feature_cache.move_to_end(cache_key)
+
+        return self._expand_cached_features(
+            language_dict_features, inverse_indices)
 
 
 class BertEncoder(nn.Module):
