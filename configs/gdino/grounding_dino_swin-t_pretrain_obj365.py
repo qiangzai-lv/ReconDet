@@ -3,6 +3,8 @@ _base_ = [
     '../mmdet_base_/schedules/schedule_1x.py', '../mmdet_base_/default_runtime.py'
 ]
 
+custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
+
 load_from = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 
 
@@ -10,7 +12,7 @@ pretrained = 'https://github.com/SwinTransformer/storage/releases/download/v1.0.
 lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
 model = dict(
-    type='mmdet.GroundingDINO',
+    type='ReconGroundingDINO',
     num_queries=64,
     with_box_refine=True,
     as_two_stage=True,
@@ -96,7 +98,7 @@ model = dict(
     positional_encoding=dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
-        type='mmdet.GroundingDINOHead',
+        type='ReconGroundingDINOHead',
         center_loss_weight=1.0,
         keypoint_loss_weight=1.0,
         num_classes=256,

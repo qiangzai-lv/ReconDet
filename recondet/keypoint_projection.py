@@ -105,12 +105,14 @@ class BBoxKeypointProjector:
 
         pixel_min = corner_pixels.masked_fill(~corner_valid[..., None], float('inf')).amin(dim=2)
         pixel_max = corner_pixels.masked_fill(~corner_valid[..., None], float('-inf')).amax(dim=2)
-        bbox_valid = corner_valid.any(dim=2)
+        bbox_valid = corner_valid.any(dim=2) & visible[..., -1]
         image_height, image_width = image_shape
-        pixel_min[..., 0].clamp_(min=0, max=image_width)
-        pixel_min[..., 1].clamp_(min=0, max=image_height)
-        pixel_max[..., 0].clamp_(min=0, max=image_width)
-        pixel_max[..., 1].clamp_(min=0, max=image_height)
+        pixel_min[..., 0].clamp_(min=0, max=valid_width)
+        pixel_min[..., 1].clamp_(min=0, max=valid_height)
+        pixel_max[..., 0].clamp_(min=0, max=valid_width)
+        pixel_max[..., 1].clamp_(min=0, max=valid_height)
+        bbox_valid &= pixel_max[..., 0] > pixel_min[..., 0]
+        bbox_valid &= pixel_max[..., 1] > pixel_min[..., 1]
         bboxes_2d = torch.stack([
             pixel_min[..., 0], pixel_min[..., 1],
             pixel_max[..., 0], pixel_max[..., 1]
