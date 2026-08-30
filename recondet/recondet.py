@@ -124,19 +124,6 @@ class ReconDet(Base3DDetector):
                     img)
                 return aggregated_tokens_list, ps_idx, img
 
-    @staticmethod
-    def _batch_tensor(value, reference):
-        if isinstance(value, torch.Tensor):
-            tensor = value
-        elif isinstance(value, (int, float)):
-            tensor = torch.as_tensor([value])
-        else:
-            tensor = torch.stack([
-                item if isinstance(item, torch.Tensor) else torch.as_tensor(item)
-                for item in value
-            ], dim=0)
-        return tensor.to(device=reference.device, dtype=torch.float32)
-
     def _get_projection_cameras(self, batch_data_samples, images):
         extrinsics = []
         intrinsics = []
@@ -159,17 +146,6 @@ class ReconDet(Base3DDetector):
             extrinsics.append(sample_extrinsics[:, :3])
             intrinsics.append(sample_intrinsic.expand(num_views, -1, -1))
         return torch.stack(extrinsics), torch.stack(intrinsics)
-
-    def _set_identity_bbox_transform(self, batch_inputs_dict, reference):
-        pose_matrix = self._batch_tensor(
-            batch_inputs_dict['pose_matrix'], reference)
-        axis_align_matrix = self._batch_tensor(
-            batch_inputs_dict['axis_align_matrix'], reference)
-        batch_inputs_dict['predicted_first_w2c'] = torch.bmm(
-            torch.linalg.inv(pose_matrix),
-            torch.linalg.inv(axis_align_matrix))
-        batch_inputs_dict['scene_scale'] = reference.new_ones(
-            reference.shape[0])
 
     @staticmethod
     def _format_gdino_losses(losses):
@@ -217,7 +193,6 @@ class ReconDet(Base3DDetector):
         query_xyz = query_xyz.to(device=images.device, dtype=images.dtype)
         query = query.to(device=images.device, dtype=feature_maps[0].dtype)
         batch_inputs_dict['query_xyz'] = query_xyz
-        self._set_identity_bbox_transform(batch_inputs_dict, query_xyz)
         return self.decoder(
             query,
             feature_maps,
