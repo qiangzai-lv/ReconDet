@@ -38,7 +38,7 @@ def _build_cost_matrix(all_centers, all_sizes, all_cls, all_objness,
         None, gt_centers, gt_sizes)
     giou = axis_aligned_bbox_overlaps_3d(
         pred_boxes.unsqueeze(0), gt_boxes.unsqueeze(0), mode='giou').squeeze(0)
-    _ensure_finite('GIoU matching cost', giou)
+    giou = torch.nan_to_num(giou, nan=-1.0, posinf=1.0, neginf=-1.0)
 
     cost_class = -all_cls.sigmoid()[:, gt_labels]
     cost_center = torch.cdist(all_centers, gt_centers, p=1)
@@ -48,8 +48,17 @@ def _build_cost_matrix(all_centers, all_sizes, all_cls, all_objness,
         cost_weights['center'] * cost_center +
         cost_weights['obj_ness'] * cost_objness -
         cost_weights['giou'] * giou)
-    _ensure_finite('Hungarian cost matrix', total_cost)
+    total_cost = torch.nan_to_num(
+        total_cost, nan=1e6, posinf=1e6, neginf=1e6)
     return total_cost, giou
+
+
+def _linear_sum_assignment(cost):
+    cost_numpy = torch.nan_to_num(
+        cost.detach().float(), nan=1e6, posinf=1e6,
+        neginf=1e6).cpu().numpy()
+    pred_indices, gt_indices = linear_sum_assignment(cost_numpy)
+    return pred_indices, gt_indices
 
 
 class UnifiedMatcher(nn.Module):
@@ -66,7 +75,7 @@ class UnifiedMatcher(nn.Module):
             all_centers, all_sizes, all_cls, all_objness,
             gt_centers, gt_sizes, gt_labels, self.cost_weights)
 
-        pred_indices, gt_indices = linear_sum_assignment(total_cost.cpu().numpy())
+        pred_indices, gt_indices = _linear_sum_assignment(total_cost)
         return torch.from_numpy(pred_indices).long().to(all_centers.device), torch.from_numpy(gt_indices).long().to(
             all_centers.device)
 
@@ -95,7 +104,7 @@ class UnifiedMatcherMoreThanOne(nn.Module):
             all_centers, all_sizes, all_cls, all_objness,
             gt_centers, gt_sizes, gt_labels, self.cost_weights)
 
-        pred_indices, gt_indices = linear_sum_assignment(total_cost.cpu().numpy())
+        pred_indices, gt_indices = _linear_sum_assignment(total_cost)
         pred_indices = torch.from_numpy(pred_indices).long().to(all_centers.device)
         gt_indices = torch.from_numpy(gt_indices).long().to(all_centers.device)
 

@@ -134,8 +134,11 @@ class TopkHungarianAssigner(TaskAlignedAssigner):
                                              None].repeat(1, 1, topk).view(
                                                  select_cost.size(0), -1)
             # anchor index and gt index
+            repeat_select_cost = torch.nan_to_num(
+                repeat_select_cost.detach().float(), nan=1e6,
+                posinf=1e6, neginf=1e6)
             matched_row_inds, matched_col_inds = linear_sum_assignment(
-                repeat_select_cost.detach().cpu().numpy())
+                repeat_select_cost.cpu().numpy())
             matched_row_inds = torch.from_numpy(matched_row_inds).to(
                 pred_scores.device)
             matched_col_inds = torch.from_numpy(matched_col_inds).to(
