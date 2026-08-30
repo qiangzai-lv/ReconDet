@@ -81,6 +81,7 @@ model = dict(
     token_dim=_token_dim_,
     test_only_last_layer=True,
     enable_detection_loss=True,
+    enable_2d_loss=True,
     if_mix_precision=True,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)

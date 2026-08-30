@@ -40,7 +40,8 @@ class ReconDet(Base3DDetector):
             grounding_dino_checkpoint=None,
             semantic_classes=(),
             grounding_dino_print_score_thr=0.3,
-            deformable_num_points=4
+            deformable_num_points=4,
+            enable_2d_loss=True
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -106,6 +107,7 @@ class ReconDet(Base3DDetector):
         self.if_mix_precision = if_mix_precision
         self.if_save_vggt_feature = if_save_vggt_feature
         self.enable_detection_loss = enable_detection_loss
+        self.enable_2d_loss = enable_2d_loss
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -166,6 +168,19 @@ class ReconDet(Base3DDetector):
             formatted[name] = torch.stack(values).sum()
         return formatted
 
+    @staticmethod
+    def _remove_2d_losses(losses):
+        """Remove Grounding DINO 2D box and keypoint supervision losses."""
+        removed_names = {
+            'loss_cls', 'loss_bbox', 'loss_iou',
+            'loss_keypoint_center', 'loss_keypoint_faces',
+        }
+        return {
+            name: value for name, value in losses.items()
+            if (name.split('.', 1)[-1] not in removed_names and
+                not name.startswith(('dn_loss_', 'enc_loss_')))
+        }
+
     def _cluster_reconstruction_queries(self, reconstruction_hidden,
                                         reconstruction_outputs, images):
         reconstruction_cls, reconstruction_points = reconstruction_outputs
@@ -222,6 +237,8 @@ class ReconDet(Base3DDetector):
                 vggt_feature_maps=vggt_feature_maps,
                 return_reconstruction=True))
         semantic_losses = self._format_gdino_losses(semantic_losses)
+        if not self.enable_2d_loss:
+            semantic_losses = self._remove_2d_losses(semantic_losses)
         losses = {f'gdino_{name}': value
                   for name, value in semantic_losses.items()}
         if self.enable_detection_loss:
