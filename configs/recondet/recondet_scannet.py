@@ -25,7 +25,7 @@ custom_imports = dict(imports=['recondet'], allow_failed_imports=False)
 env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
 
 _token_dim_ = 512
-_decoder_layer_num = 8
+_decoder_layer_num = 4
 model = dict(
     type='ReconDet',
     vggt_omega_checkpoint=vggt_omega_checkpoint,
@@ -49,7 +49,6 @@ model = dict(
         dec_nlayers=_decoder_layer_num
     ),
     deformable_num_points=4,
-    query_xyz_range=[-6.5, -9.0, -1.0, 6.5, 9.0, 4.5],
     bbox_head=dict(
         type='ReconDetHead',
         n_classes=18,

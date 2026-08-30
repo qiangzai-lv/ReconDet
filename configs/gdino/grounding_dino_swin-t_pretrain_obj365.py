@@ -95,12 +95,25 @@ model = dict(
             ffn_cfg=dict(
                 embed_dims=256, feedforward_channels=2048, ffn_drop=0.0)),
         post_norm_cfg=None),
+    reconstruction_decoder=dict(
+        query_dims=512,
+        semantic_dims=256,
+        spatial_dims=512,
+        num_layers=6,
+        num_heads=8,
+        feedforward_channels=2048,
+        num_feature_levels=4,
+        num_points=4,
+        dropout=0.0),
     positional_encoding=dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
         type='ReconGroundingDINOHead',
         center_loss_weight=1.0,
-        keypoint_loss_weight=1.0,
+        keypoint_loss_weight=0.0,
+        reconstruction_dims=512,
+        point_3d_loss_weight=6.0,
+        class_3d_loss_weight=6.0,
         num_classes=256,
         sync_cls_avg_factor=True,
         contrastive_cfg=dict(max_text_len=256, log_scale='auto', bias=True),

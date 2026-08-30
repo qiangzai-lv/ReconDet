@@ -15,9 +15,13 @@ from mmdet.utils import ConfigType
 from mmdet.models.layers import SinePositionalEncoding
 from mmdet.models.layers.transformer.grounding_dino_layers import (
     GroundingDinoTransformerDecoder, GroundingDinoTransformerEncoder)
+from mmdet.models.layers.transformer.utils import (
+    coordinate_to_encoding, inverse_sigmoid)
 from mmdet.models.detectors.dino import DINO
 from mmdet.models.detectors.glip import (
     create_positive_map, create_positive_map_label_to_token, run_ner)
+from recondet.grounding_dino_3d_decoder import (
+    GroundingDINO3DDecoder, flatten_feature_maps, recover_feature_maps)
 
 
 def clean_label_name(name: str) -> str:
@@ -56,12 +60,17 @@ class ReconGroundingDINO(DINO):
                  language_model,
                  *args,
                  use_autocast=False,
+                 reconstruction_decoder=None,
                  **kwargs) -> None:
 
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
         super().__init__(*args, **kwargs)
+        self.reconstruction_decoder = None
+        if reconstruction_decoder is not None:
+            self.reconstruction_decoder = GroundingDINO3DDecoder(
+                num_queries=self.num_queries, **reconstruction_decoder)
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
@@ -305,6 +314,7 @@ class ReconGroundingDINO(DINO):
         img_feats: Tuple[Tensor],
         text_dict: Dict,
         batch_data_samples: OptSampleList = None,
+        vggt_feature_maps=None,
     ) -> Dict:
         encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
             img_feats, batch_data_samples)
@@ -316,9 +326,113 @@ class ReconGroundingDINO(DINO):
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
         decoder_inputs_dict.update(tmp_dec_in)
 
-        decoder_outputs_dict = self.forward_decoder(**decoder_inputs_dict)
+        decoder_outputs_dict = self.forward_decoder(
+            **decoder_inputs_dict, vggt_feature_maps=vggt_feature_maps)
         head_inputs_dict.update(decoder_outputs_dict)
         return head_inputs_dict
+
+    def forward_decoder(self,
+                        query: Tensor,
+                        memory: Tensor,
+                        memory_mask: Tensor,
+                        reference_points: Tensor,
+                        spatial_shapes: Tensor,
+                        level_start_index: Tensor,
+                        valid_ratios: Tensor,
+                        dn_mask: Optional[Tensor] = None,
+                        vggt_feature_maps=None,
+                        **kwargs) -> Dict:
+        if self.reconstruction_decoder is None or vggt_feature_maps is None:
+            return super().forward_decoder(
+                query=query,
+                memory=memory,
+                memory_mask=memory_mask,
+                reference_points=reference_points,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                valid_ratios=valid_ratios,
+                dn_mask=dn_mask,
+                **kwargs)
+
+        semantic_feature_maps = recover_feature_maps(memory, spatial_shapes)
+        semantic_features = flatten_feature_maps(semantic_feature_maps)
+        spatial_features = flatten_feature_maps(vggt_feature_maps)
+        spatial_query = self.reconstruction_decoder.initialize_query(
+            query.shape[0])
+        intermediate = []
+        intermediate_reference_points = [reference_points]
+        reconstruction_intermediate = []
+
+        for layer_id, layer in enumerate(self.decoder.layers):
+            reference_points_input = reference_points[:, :, None] * torch.cat(
+                [valid_ratios, valid_ratios], dim=-1)[:, None]
+            query_sine_embed = coordinate_to_encoding(
+                reference_points_input[:, :, 0, :])
+            query_pos = self.decoder.ref_point_head(query_sine_embed)
+
+            query = layer(
+                query,
+                query_pos=query_pos,
+                value=memory,
+                key_padding_mask=memory_mask,
+                self_attn_mask=dn_mask,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                valid_ratios=valid_ratios,
+                reference_points=reference_points_input,
+                **kwargs)
+
+            bbox_delta = self.bbox_head.reg_branches[layer_id](query)
+            new_reference_points = (
+                bbox_delta + inverse_sigmoid(
+                    reference_points, eps=1e-3)).sigmoid()
+            reference_points = new_reference_points.detach()
+
+            if self.decoder.return_intermediate:
+                intermediate.append(self.decoder.norm(query))
+                intermediate_reference_points.append(new_reference_points)
+
+            matching_reference_points = reference_points[
+                :, -self.num_queries:, :2]
+            if layer_id == len(self.decoder.layers) - 1:
+                spatial_query = (
+                    self.reconstruction_decoder.add_final_reference_embedding(
+                        spatial_query, matching_reference_points))
+            spatial_query, reconstruction_output = (
+                self.reconstruction_decoder.forward_layer(
+                    layer_id=layer_id,
+                    query=spatial_query,
+                    semantic_features=semantic_features,
+                    spatial_features=spatial_features,
+                    reference_points=matching_reference_points,
+                    valid_ratios=valid_ratios,
+                    semantic_key_padding_mask=memory_mask))
+            reconstruction_intermediate.append(reconstruction_output)
+
+        if self.decoder.return_intermediate:
+            inter_states = torch.stack(intermediate)
+            references = torch.stack(intermediate_reference_points)
+        else:
+            inter_states = query
+            references = reference_points
+
+        if len(query) == self.num_queries:
+            inter_states[0] += \
+                self.dn_query_generator.label_embedding.weight[0, 0] * 0.0
+
+        reconstruction_hidden_states = torch.stack(
+            reconstruction_intermediate)
+        if self.reconstruction_decoder is not None:
+            reconstruction_outputs = self.bbox_head.predict_reconstruction(
+                reconstruction_hidden_states,
+                kwargs.get('memory_text'),
+                kwargs.get('text_attention_mask'))
+            self._last_reconstruction_hidden_states = reconstruction_hidden_states
+            self._last_reconstruction_outputs = reconstruction_outputs
+        return dict(
+            hidden_states=inter_states,
+            references=list(references),
+            reconstruction_hidden_states=reconstruction_hidden_states)
 
     def forward_encoder(self, feat: Tensor, feat_mask: Tensor,
                         feat_pos: Tensor, spatial_shapes: Tensor,
@@ -417,7 +531,8 @@ class ReconGroundingDINO(DINO):
         return decoder_inputs_dict, head_inputs_dict
 
     def loss(self, batch_inputs: Tensor,
-             batch_data_samples: SampleList) -> Union[dict, list]:
+             batch_data_samples: SampleList, vggt_feature_maps=None,
+             return_reconstruction=False) -> Union[dict, list]:
         text_prompts = [
             data_samples.text for data_samples in batch_data_samples
         ]
@@ -494,14 +609,27 @@ class ReconGroundingDINO(DINO):
                 visual_features = self.extract_feat(batch_inputs)
         else:
             visual_features = self.extract_feat(batch_inputs)
-        head_inputs_dict = self.forward_transformer(visual_features, text_dict,
-                                                    batch_data_samples)
+        head_inputs_dict = self.forward_transformer(
+            visual_features, text_dict, batch_data_samples,
+            vggt_feature_maps=vggt_feature_maps)
+
+        reconstruction_hidden_states = head_inputs_dict.pop(
+            'reconstruction_hidden_states', None)
 
         losses = self.bbox_head.loss(
-            **head_inputs_dict, batch_data_samples=batch_data_samples)
+            **head_inputs_dict,
+            reconstruction_hidden_states=reconstruction_hidden_states,
+            batch_data_samples=batch_data_samples)
+        if return_reconstruction:
+            reconstruction_outputs = self.bbox_head.predict_reconstruction(
+                reconstruction_hidden_states,
+                text_dict['embedded'],
+                text_dict['text_token_mask'])
+            return losses, reconstruction_hidden_states, reconstruction_outputs
         return losses
 
-    def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
+    def predict(self, batch_inputs, batch_data_samples, rescale: bool = True,
+                vggt_feature_maps=None):
         text_prompts = []
         enhanced_text_prompts = []
         tokens_positives = []
@@ -563,7 +691,8 @@ class ReconGroundingDINO(DINO):
                     0].token_positive_map = token_positive_maps_once
 
                 head_inputs_dict = self.forward_transformer(
-                    copy.deepcopy(visual_feats), text_dict, batch_data_samples)
+                    copy.deepcopy(visual_feats), text_dict, batch_data_samples,
+                    vggt_feature_maps=vggt_feature_maps)
                 pred_instances = self.bbox_head.predict(
                     **head_inputs_dict,
                     rescale=rescale,
@@ -592,7 +721,8 @@ class ReconGroundingDINO(DINO):
                 data_samples.token_positive_map = token_positive_maps[i]
 
             head_inputs_dict = self.forward_transformer(
-                visual_feats, text_dict, batch_data_samples)
+                visual_feats, text_dict, batch_data_samples,
+                vggt_feature_maps=vggt_feature_maps)
             results_list = self.bbox_head.predict(
                 **head_inputs_dict,
                 rescale=rescale,

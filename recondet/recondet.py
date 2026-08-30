@@ -12,6 +12,7 @@ from recondet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from recondet.device import autocast, get_device
 from recondet.geometry_attention import GeometryAwareDeformableDecoder
 from recondet.grounding_dino_encoder import GroundingDINOSemanticEncoder
+from recondet.scene_query_clustering import WeightedFPSKMeans
 from vggt_omega.models import VGGTOmega
 
 device = get_device()
@@ -40,8 +41,7 @@ class ReconDet(Base3DDetector):
             grounding_dino_print_score_thr=0.3,
             grounding_dino_visualization_dir=None,
             grounding_dino_visualization_interval=100,
-            deformable_num_points=4,
-            query_xyz_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
+            deformable_num_points=4
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -50,19 +50,13 @@ class ReconDet(Base3DDetector):
         bbox_head.update(test_cfg=test_cfg)
         self.bbox_head = MODELS.build(bbox_head)
 
-        self.semantic_encoder = None
-        if grounding_dino_config is not None:
-            if grounding_dino_checkpoint is None:
-                raise ValueError(
-                    'grounding_dino_checkpoint is required when '
-                    'grounding_dino_config is set.')
-            self.semantic_encoder = GroundingDINOSemanticEncoder(
-                config=grounding_dino_config,
-                checkpoint=grounding_dino_checkpoint,
-                classes=semantic_classes,
-                print_score_thr=grounding_dino_print_score_thr,
-                visualization_dir=grounding_dino_visualization_dir,
-                visualization_interval=grounding_dino_visualization_interval)
+        self.semantic_encoder = GroundingDINOSemanticEncoder(
+            config=grounding_dino_config,
+            checkpoint=grounding_dino_checkpoint,
+            classes=semantic_classes,
+            print_score_thr=grounding_dino_print_score_thr,
+            visualization_dir=grounding_dino_visualization_dir,
+            visualization_interval=grounding_dino_visualization_interval)
 
         self.vggt_encoder = VGGTOmega()
         self.vggt_encoder.load_state_dict(
@@ -97,7 +91,8 @@ class ReconDet(Base3DDetector):
         self.test_cfg = test_cfg
 
         self.num_queries = num_queries
-
+        self.scene_query_clustering = WeightedFPSKMeans(
+            num_clusters=num_queries, num_iterations=5)
         self.test_only_last_layer = test_only_last_layer
 
         self.pos_embedding = PositionEmbeddingCoordsSine(
@@ -113,11 +108,6 @@ class ReconDet(Base3DDetector):
         )
         self.if_mix_precision = if_mix_precision
         self.if_save_vggt_feature = if_save_vggt_feature
-
-        query_xyz_range = torch.as_tensor(query_xyz_range, dtype=torch.float32)
-        query_xyz_range = query_xyz_range.reshape(2, 3)
-        self.register_buffer(
-            'query_xyz_range', query_xyz_range, persistent=False)
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -185,44 +175,59 @@ class ReconDet(Base3DDetector):
         batch_inputs_dict['scene_scale'] = reference.new_ones(
             reference.shape[0])
 
+    @staticmethod
+    def _format_gdino_losses(losses):
+        aggregated = {}
+        passthrough = {}
+        for name, value in losses.items():
+            if name.startswith('d') and '.' in name:
+                layer_name, loss_name = name.split('.', 1)
+                if layer_name[1:].isdigit():
+                    aggregated.setdefault(loss_name, []).append(value)
+                    continue
+            passthrough[name] = value
+
+        formatted = dict(passthrough)
+        for name, values in aggregated.items():
+            formatted[name] = torch.stack(values).sum()
+        return formatted
+
+    def _cluster_reconstruction_queries(self, reconstruction_hidden,
+                                        reconstruction_outputs, images):
+        reconstruction_cls, reconstruction_points = reconstruction_outputs
+        batch_size, num_views = images.shape[:2]
+        reconstruction_hidden = reconstruction_hidden[-1].reshape(
+            batch_size, num_views * reconstruction_hidden.shape[2],
+            reconstruction_hidden.shape[3])
+        reconstruction_points = reconstruction_points.reshape(
+            batch_size, num_views * reconstruction_points.shape[1], 3)
+        reconstruction_cls = reconstruction_cls.reshape(
+            batch_size, num_views * reconstruction_cls.shape[1],
+            reconstruction_cls.shape[2])
+        return self.scene_query_clustering(
+            reconstruction_points, reconstruction_hidden, reconstruction_cls)
+
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
-                         images, batch_data_samples):
+                         images, batch_data_samples, query_xyz, query):
         feature_maps = self.feature_projector(
             vggt_token_list,
             images,
             ps_idx)
-        vggt_extrinsics, vggt_intrinsics = self._get_projection_cameras(
+        camera_extrinsics, camera_intrinsics = self._get_projection_cameras(
             batch_data_samples, images)
-        batch_inputs_dict['vggt_extrinsics'] = vggt_extrinsics
-        batch_inputs_dict['vggt_intrinsics'] = vggt_intrinsics
+        batch_inputs_dict['camera_extrinsics'] = camera_extrinsics
+        batch_inputs_dict['camera_intrinsics'] = camera_intrinsics
 
-        batch_size = images.shape[0]
-        reference_min = self.query_xyz_range[0].to(images).expand(
-            batch_size, -1)
-        reference_max = self.query_xyz_range[1].to(images).expand(
-            batch_size, -1)
-        point_cloud_dims = (reference_min, reference_max)
-        query_xyz, _ = self.get_query_embeddings(
-            reference_min[:, None], point_cloud_dims)
-        reference_points = (
-            (query_xyz - reference_min[:, None]) /
-            (reference_max - reference_min)[:, None]).clamp(1e-5, 1 - 1e-5)
-
+        query_xyz = query_xyz.to(device=images.device, dtype=images.dtype)
+        query = query.to(device=images.device, dtype=feature_maps[0].dtype)
         batch_inputs_dict['query_xyz'] = query_xyz
-        batch_inputs_dict['reference_min'] = reference_min
-        batch_inputs_dict['reference_max'] = reference_max
         self._set_identity_bbox_transform(batch_inputs_dict, query_xyz)
-        query = torch.zeros(
-            batch_size, self.num_queries, feature_maps[0].shape[2],
-            device=query_xyz.device, dtype=feature_maps[0].dtype)
         return self.decoder(
             query,
             feature_maps,
-            reference_points,
-            reference_min,
-            reference_max,
-            vggt_extrinsics,
-            vggt_intrinsics,
+            query_xyz,
+            camera_extrinsics,
+            camera_intrinsics,
             images.shape[-2:],
             self.pos_embedding,
             self.query_projection,
@@ -230,59 +235,56 @@ class ReconDet(Base3DDetector):
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
-
-        if self.semantic_encoder is not None:
-            semantic_losses = self.semantic_encoder.loss(
-                batch_inputs_dict['imgs'], batch_data_samples)
-            return {f'gdino_{name}': value
-                    for name, value in semantic_losses.items()}
-
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
-
-        if self.if_mix_precision:
-            with autocast(img.device):
-                box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    batch_data_samples)
-        else:
-            box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples)
-
-        losses = self.bbox_head.loss(
+        vggt_feature_maps = self.feature_projector(
+            vggt_token_list, img, ps_idx)
+        semantic_losses, reconstruction_hidden, reconstruction_outputs = (
+            self.semantic_encoder.loss(
+                batch_inputs_dict['imgs'],
+                batch_data_samples,
+                vggt_feature_maps=vggt_feature_maps,
+                return_reconstruction=True))
+        query_xyz, query = self._cluster_reconstruction_queries(
+            reconstruction_hidden, reconstruction_outputs,
+            batch_inputs_dict['imgs'])[:2]
+        box_features, refined_query_xyz = self.get_box_features(
+            vggt_token_list, ps_idx, batch_inputs_dict, img,
+            batch_data_samples, query_xyz, query)
+        detection_losses = self.bbox_head.loss(
             box_features,
             batch_data_samples,
             batch_inputs_dict,
             refined_query_xyz=refined_query_xyz,
             **kwargs)
-        if self.semantic_encoder is not None:
-            losses.update({f'gdino_{name}': value
-                           for name, value in semantic_losses.items()})
+        semantic_losses = self._format_gdino_losses(semantic_losses)
+        losses = {f'gdino_{name}': value
+                  for name, value in semantic_losses.items()}
+        losses.update({f'recondet_{name}': value
+                       for name, value in detection_losses.items()})
         return losses
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:
 
         vggt_token_list, ps_idx, img = self.extract_feat(
-            batch_inputs_dict, batch_data_samples, 'train')
-
-        if self.if_mix_precision:
-            with autocast(img.device):
-                box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    batch_data_samples)
-        else:
-            box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples)
-
+            batch_inputs_dict, batch_data_samples, 'test')
+        reconstruction_outputs = self.semantic_encoder.predict_reconstruction(
+            batch_inputs_dict['imgs'], batch_data_samples,
+            self.feature_projector(vggt_token_list, img, ps_idx))
+        reconstruction_hidden = (
+            self.semantic_encoder.model._last_reconstruction_hidden_states)
+        query_xyz, query = self._cluster_reconstruction_queries(
+            reconstruction_hidden, reconstruction_outputs,
+            batch_inputs_dict['imgs'])[:2]
+        box_features, refined_query_xyz = self.get_box_features(
+            vggt_token_list, ps_idx, batch_inputs_dict, img,
+            batch_data_samples, query_xyz, query)
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
             refined_query_xyz = [refined_query_xyz[-1]]
             layer_ids = [layer_ids[-1]]
-
         results_list = self.bbox_head.predict(
             box_features,
             batch_data_samples,
@@ -299,15 +301,18 @@ class ReconDet(Base3DDetector):
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
 
-        if self.if_mix_precision:
-            with autocast(img.device):
-                box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    batch_data_samples)
-        else:
-            box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples)
+        _, reconstruction_hidden, reconstruction_outputs = (
+            self.semantic_encoder.loss(
+                batch_inputs_dict['imgs'], batch_data_samples,
+                vggt_feature_maps=self.feature_projector(
+                    vggt_token_list, img, ps_idx),
+                return_reconstruction=True))
+        query_xyz, query = self._cluster_reconstruction_queries(
+            reconstruction_hidden, reconstruction_outputs,
+            batch_inputs_dict['imgs'])[:2]
+        box_features, refined_query_xyz = self.get_box_features(
+            vggt_token_list, ps_idx, batch_inputs_dict, img,
+            batch_data_samples, query_xyz, query)
 
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
@@ -318,17 +323,3 @@ class ReconDet(Base3DDetector):
         results = self.bbox_head.forward(
             box_features, batch_inputs_dict, refined_query_xyz, layer_ids)
         return results
-
-    def get_query_embeddings(self, encoder_xyz, point_cloud_dims):
-        reference_min, reference_max = point_cloud_dims
-        batch_size = encoder_xyz.shape[0]
-        reference_points = torch.rand(
-            batch_size, self.num_queries, 3,
-            device=encoder_xyz.device,
-            dtype=encoder_xyz.dtype).clamp(1e-5, 1 - 1e-5)
-        query_xyz = reference_min[:, None] + reference_points * (
-            reference_max - reference_min)[:, None]
-        pos_embed = self.pos_embedding(
-            query_xyz, input_range=point_cloud_dims)
-        query_embed = self.query_projection(pos_embed)
-        return query_xyz, query_embed

@@ -20,6 +20,7 @@ from mmdet.models.layers import inverse_sigmoid
 from mmdet.models.dense_heads.atss_vlfusion_head import (
     convert_grounding_to_cls_scores)
 from mmdet.models.dense_heads.dino_head import DINOHead
+from recondet.grounding_dino_3d_head import GroundingDINO3DHead
 
 
 class ContrastiveEmbed(nn.Module):
@@ -106,6 +107,9 @@ class ReconGroundingDINOHead(DINOHead):
         self.max_text_len = contrastive_cfg.get('max_text_len', 256)
         self.keypoint_loss_weight = kwargs.pop('keypoint_loss_weight', 1.0)
         self.center_loss_weight = kwargs.pop('center_loss_weight', 1.0)
+        self.reconstruction_dims = kwargs.pop('reconstruction_dims', 512)
+        self.point_3d_loss_weight = kwargs.pop('point_3d_loss_weight', 1.0)
+        self.class_3d_loss_weight = kwargs.pop('class_3d_loss_weight', 1.0)
         self.keypoint_assigner = TASK_UTILS.build(
             dict(
                 type='HungarianAssigner',
@@ -154,6 +158,9 @@ class ReconGroundingDINOHead(DINOHead):
                 for _ in range(self.num_pred_layer)
             ])
         self._last_keypoint_outputs = None
+        self.reconstruction_head = GroundingDINO3DHead(
+            query_dims=self.reconstruction_dims,
+            semantic_dims=self.embed_dims)
 
     def init_weights(self) -> None:
         """Initialize weights of the Deformable DETR head."""
@@ -360,19 +367,21 @@ class ReconGroundingDINOHead(DINOHead):
             target_center = gt_keypoints[gt_index, 6]
             center_losses.append(torch.abs(pred_center - target_center).mean())
 
-            visible_faces = gt_keypoints[gt_index, :6][gt_visible[gt_index, :6]]
-            visible_faces = visible_faces[:3]
-            if visible_faces.numel() == 0:
-                continue
-            predicted_faces = keypoints[pred_index, 1:]
-            costs = torch.cdist(predicted_faces, visible_faces, p=1)
-            num_faces = visible_faces.shape[0]
-            assignment_costs = []
-            for selected in itertools.permutations(range(3), num_faces):
-                assignment_costs.append(
-                    costs[list(selected), torch.arange(num_faces,
-                                                       device=costs.device)].mean())
-            face_losses.append(torch.stack(assignment_costs).min())
+            if self.keypoint_loss_weight > 0:
+                visible_faces = gt_keypoints[gt_index, :6][
+                    gt_visible[gt_index, :6]]
+                visible_faces = visible_faces[:3]
+                if visible_faces.numel() == 0:
+                    continue
+                predicted_faces = keypoints[pred_index, 1:]
+                costs = torch.cdist(predicted_faces, visible_faces, p=1)
+                num_faces = visible_faces.shape[0]
+                assignment_costs = []
+                for selected in itertools.permutations(range(3), num_faces):
+                    assignment_costs.append(
+                        costs[list(selected), torch.arange(
+                            num_faces, device=costs.device)].mean())
+                face_losses.append(torch.stack(assignment_costs).min())
 
         zero = keypoints.sum() * 0
         center_loss = (torch.stack(center_losses).mean()
@@ -380,6 +389,98 @@ class ReconGroundingDINOHead(DINOHead):
         face_loss = (torch.stack(face_losses).mean()
                      if face_losses else zero)
         return center_loss, face_loss
+
+    def _get_3d_targets_single(self, cls_score, bbox_pred, gt_instances,
+                               img_meta):
+        img_h, img_w = img_meta['img_shape']
+        factor = bbox_pred.new_tensor([img_w, img_h, img_w, img_h])
+        pred_boxes = bbox_cxcywh_to_xyxy(bbox_pred) * factor
+        assign_result = self.assigner.assign(
+            pred_instances=InstanceData(
+                scores=cls_score, bboxes=pred_boxes),
+            gt_instances=gt_instances,
+            img_meta=img_meta)
+
+        pos_inds = torch.nonzero(
+            assign_result.gt_inds > 0, as_tuple=False).flatten()
+        neg_inds = torch.nonzero(
+            assign_result.gt_inds == 0, as_tuple=False).flatten()
+        assigned_gt_inds = assign_result.gt_inds[pos_inds] - 1
+
+        labels = cls_score.new_zeros(
+            (bbox_pred.shape[0], self.max_text_len))
+        label_weights = cls_score.new_ones(bbox_pred.shape[0])
+        point_targets = bbox_pred.new_zeros((bbox_pred.shape[0], 3))
+        point_weights = bbox_pred.new_zeros(bbox_pred.shape[0])
+        if pos_inds.numel() > 0:
+            labels[pos_inds] = gt_instances.positive_maps[assigned_gt_inds]
+            point_targets[pos_inds] = gt_instances.keypoints_3d[
+                assigned_gt_inds, 6]
+            point_weights[pos_inds] = 1.0
+        return (labels, label_weights, point_targets, point_weights,
+                pos_inds.numel(), neg_inds.numel())
+
+    def _loss_3d(self, reconstruction_hidden_states, cls_scores_2d,
+                 bbox_preds_2d, memory_text, text_token_mask,
+                 batch_gt_instances, batch_img_metas, class_branch):
+        query = reconstruction_hidden_states[-1]
+        cls_scores_3d, points_3d = self.reconstruction_head(
+            query, memory_text, text_token_mask, class_branch)
+
+        targets = [
+            self._get_3d_targets_single(
+                cls_score, bbox_pred, gt_instances, img_meta)
+            for cls_score, bbox_pred, gt_instances, img_meta in zip(
+                cls_scores_2d, bbox_preds_2d, batch_gt_instances,
+                batch_img_metas)
+        ]
+        labels = torch.stack([target[0] for target in targets])
+        label_weights = torch.stack([target[1] for target in targets])
+        point_targets = torch.stack([target[2] for target in targets])
+        point_weights = torch.stack([target[3] for target in targets])
+        num_total_pos = sum(target[4] for target in targets)
+        num_total_neg = sum(target[5] for target in targets)
+
+        text_masks = text_token_mask.new_zeros(
+            (text_token_mask.shape[0], self.max_text_len))
+        text_masks[:, :text_token_mask.shape[1]] = text_token_mask
+        text_mask = (text_masks > 0).unsqueeze(1).expand(
+            -1, cls_scores_3d.shape[1], -1)
+        masked_cls_scores = torch.masked_select(
+            cls_scores_3d, text_mask).contiguous()
+        masked_labels = torch.masked_select(labels, text_mask)
+        expanded_label_weights = label_weights[..., None].expand_as(text_mask)
+        masked_label_weights = torch.masked_select(
+            expanded_label_weights, text_mask)
+
+        cls_avg_factor = (
+            num_total_pos + num_total_neg * self.bg_cls_weight)
+        if self.sync_cls_avg_factor:
+            cls_avg_factor = reduce_mean(
+                cls_scores_3d.new_tensor([cls_avg_factor]))
+        cls_avg_factor = max(float(cls_avg_factor), 1.0)
+        loss_cls = self.loss_cls(
+            masked_cls_scores,
+            masked_labels,
+            masked_label_weights,
+            avg_factor=cls_avg_factor)
+
+        point_error = (points_3d - point_targets).abs().mean(dim=-1)
+        point_avg_factor = torch.clamp(
+            reduce_mean(points_3d.new_tensor([num_total_pos])),
+            min=1.0).item()
+        loss_point = (
+            point_error * point_weights).sum() / point_avg_factor
+        return (
+            self.class_3d_loss_weight * loss_cls,
+            self.point_3d_loss_weight * loss_point)
+
+    def predict_reconstruction(self, reconstruction_hidden_states,
+                               memory_text, text_token_mask):
+        query = reconstruction_hidden_states[-1]
+        return self.reconstruction_head(
+            query, memory_text, text_token_mask,
+            self.cls_branches[self.num_pred_layer - 1])
 
     def loss_by_feat(self, all_layers_cls_scores, all_layers_bbox_preds,
                      enc_cls_scores, enc_bbox_preds, batch_gt_instances,
@@ -412,8 +513,9 @@ class ReconGroundingDINOHead(DINOHead):
             face_losses.append(face_loss)
         losses['loss_keypoint_center'] = self.center_loss_weight * torch.stack(
             center_losses).mean()
-        losses['loss_keypoint_faces'] = self.keypoint_loss_weight * torch.stack(
-            face_losses).mean()
+        if self.keypoint_loss_weight > 0:
+            losses['loss_keypoint_faces'] = (
+                self.keypoint_loss_weight * torch.stack(face_losses).mean())
         return losses
 
     def predict(self,
@@ -599,7 +701,9 @@ class ReconGroundingDINOHead(DINOHead):
     def loss(self, hidden_states: Tensor, references: List[Tensor],
              memory_text: Tensor, text_token_mask: Tensor,
              enc_outputs_class: Tensor, enc_outputs_coord: Tensor,
-             batch_data_samples: SampleList, dn_meta: Dict[str, int]) -> dict:
+             batch_data_samples: SampleList, dn_meta: Dict[str, int],
+             reconstruction_hidden_states: Tensor = None,
+             layer_ids: List[int] = None) -> dict:
         """Perform forward propagation and loss calculation of the detection
         head on the queries of the upstream network.
 
@@ -644,7 +748,32 @@ class ReconGroundingDINOHead(DINOHead):
         self.text_masks = text_token_mask
         loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
                               batch_gt_instances, batch_img_metas, dn_meta)
-        losses = self.loss_by_feat(*loss_inputs)
+        if layer_ids is not None:
+            original_layer_ids = self.loss_layer_ids
+            self.loss_layer_ids = layer_ids
+            losses = self.loss_by_feat(*loss_inputs)
+            self.loss_layer_ids = original_layer_ids
+        else:
+            losses = self.loss_by_feat(*loss_inputs)
+        if reconstruction_hidden_states is not None:
+            cls_scores_2d, bbox_preds_2d = outs
+            cls_scores_2d = cls_scores_2d[-1]
+            bbox_preds_2d = bbox_preds_2d[-1]
+            if dn_meta is not None:
+                num_dn = dn_meta['num_denoising_queries']
+                cls_scores_2d = cls_scores_2d[:, num_dn:]
+                bbox_preds_2d = bbox_preds_2d[:, num_dn:]
+            loss_3d_cls, loss_3d_point = self._loss_3d(
+                reconstruction_hidden_states,
+                cls_scores_2d,
+                bbox_preds_2d,
+                memory_text,
+                text_token_mask,
+                batch_gt_instances,
+                batch_img_metas,
+                self.cls_branches[hidden_states.shape[0] - 1])
+            losses['loss_3d_cls'] = loss_3d_cls
+            losses['loss_3d_point'] = loss_3d_point
         return losses
 
     def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,

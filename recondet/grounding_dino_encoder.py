@@ -66,6 +66,9 @@ class GroundingDINOSemanticEncoder(nn.Module):
                        self.model.bbox_head):
             for parameter in module.parameters():
                 parameter.requires_grad = True
+        if self.model.reconstruction_decoder is not None:
+            for parameter in self.model.reconstruction_decoder.parameters():
+                parameter.requires_grad = True
         self.model.eval()
 
         self.classes = tuple(classes)
@@ -335,6 +338,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
                     [image_width, image_height, image_width, image_height])
                 instances.keypoints_2d = keypoints[valid]
                 instances.keypoints_visible = visible[valid]
+                instances.keypoints_3d = source_instances.keypoints_3d[valid]
                 sample.gt_instances = instances
                 samples.append(sample)
         return samples
@@ -377,7 +381,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 if module is not None:
                     module.eval()
 
-    def loss(self, images, batch_data_samples):
+    def loss(self, images, batch_data_samples, vggt_feature_maps=None,
+             return_reconstruction=False):
         self.training_iteration += 1
         batch_size, num_views = images.shape[:2]
         padded_shape = images.shape[-2:]
@@ -389,8 +394,18 @@ class GroundingDINOSemanticEncoder(nn.Module):
         normalized = self._normalize_images(images, batch_data_samples)
         samples = self._make_training_samples(
             batch_data_samples, num_views, padded_shape)
-        losses = self.model.loss(normalized, samples)
-        return losses
+        flattened_vggt_features = None
+        if vggt_feature_maps is not None:
+            flattened_vggt_features = [
+                feature.reshape(
+                    batch_size * num_views, *feature.shape[2:]).contiguous()
+                for feature in vggt_feature_maps
+            ]
+        return self.model.loss(
+            normalized,
+            samples,
+            vggt_feature_maps=flattened_vggt_features,
+            return_reconstruction=return_reconstruction)
 
     @torch.no_grad()
     def predict_and_print(self, images, batch_data_samples) -> None:
@@ -438,3 +453,29 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 module = getattr(self.model, module_name, None)
                 if module is not None:
                     module.eval()
+
+    @torch.no_grad()
+    def predict_reconstruction(self, images, batch_data_samples,
+                               vggt_feature_maps):
+        padded_shape = images.shape[-2:]
+        batch_size, num_views = images.shape[:2]
+        flattened = self._normalize_images(images, batch_data_samples)
+        samples = []
+        for source_sample in batch_data_samples:
+            for view_index in range(num_views):
+                samples.append(self._make_data_sample(
+                    source_sample, view_index, padded_shape))
+        flattened_vggt_features = [
+            feature.reshape(
+                batch_size * num_views, *feature.shape[2:]).contiguous()
+            for feature in vggt_feature_maps
+        ]
+        was_training = self.model.training
+        self.model.eval()
+        self.model.predict(
+            flattened, samples, rescale=False,
+            vggt_feature_maps=flattened_vggt_features)
+        reconstruction_outputs = self.model._last_reconstruction_outputs
+        if was_training:
+            self.model.train()
+        return reconstruction_outputs

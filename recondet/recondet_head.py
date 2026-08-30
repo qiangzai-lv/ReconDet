@@ -169,11 +169,15 @@ class ReconDetHead(BaseModule):
              batch_inputs_dict: dict, refined_query_xyz=None, **kwargs) -> dict:
         if refined_query_xyz is None or len(refined_query_xyz) != len(x):
             raise ValueError('Loss requires one refined reference per layer')
-        layer_ids = self.loss_layer_ids
-        supervised_features = [x[layer_id] for layer_id in layer_ids]
-        supervised_references = [
-            refined_query_xyz[layer_id] for layer_id in layer_ids
-        ]
+        layer_ids = kwargs.pop('layer_ids', self.loss_layer_ids)
+        if len(x) == len(layer_ids):
+            supervised_features = list(x)
+            supervised_references = list(refined_query_xyz)
+        else:
+            supervised_features = [x[layer_id] for layer_id in layer_ids]
+            supervised_references = [
+                refined_query_xyz[layer_id] for layer_id in layer_ids
+            ]
         center_preds, size_preds, cls_preds = self(
             supervised_features,
             batch_inputs_dict,
