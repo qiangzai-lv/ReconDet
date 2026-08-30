@@ -21,9 +21,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  config: str,
                  checkpoint: str,
                  classes: Sequence[str],
-                 print_score_thr: float = 0.3,
-                 visualization_dir: str = None,
-                 visualization_interval: int = 100) -> None:
+                 print_score_thr: float = 0.3) -> None:
         super().__init__()
         if not classes:
             raise ValueError('GroundingDINO classes must not be empty.')
@@ -73,14 +71,6 @@ class GroundingDINOSemanticEncoder(nn.Module):
 
         self.classes = tuple(classes)
         self.print_score_thr = print_score_thr
-        if visualization_interval < 1:
-            raise ValueError('visualization_interval must be at least 1.')
-        self.visualization_interval = visualization_interval
-        self.training_iteration = 0
-        self.visualization_dir = (
-            Path(visualization_dir).expanduser()
-            if visualization_dir is not None else None)
-        self.visualization_iteration = 0
         self.register_buffer(
             'image_mean',
             torch.tensor(image_mean).view(1, 3, 1, 1),
@@ -139,156 +129,6 @@ class GroundingDINOSemanticEncoder(nn.Module):
             if image_width < width:
                 flattened[start:end, :, :, image_width:] = 0
         return flattened
-
-    def _save_visualization(self, image, prediction, source_sample,
-                            batch_index: int, view_index: int) -> None:
-        if self.visualization_dir is None or not is_main_process():
-            return
-
-        image_height, image_width = self._image_shape(
-            source_sample, view_index, image.shape[-2:])
-        rgb_image = image[:, :image_height, :image_width]
-        rgb_image = rgb_image.permute(1, 2, 0).detach().cpu().numpy()
-        bgr_image = rgb_image.clip(0, 255).astype('uint8')[..., ::-1].copy()
-
-        instances = prediction.pred_instances
-        keep = instances.scores >= self.print_score_thr
-        instances = instances[keep].cpu()
-        label_names = getattr(instances, 'label_names', [])
-        colors = [
-            (230, 159, 0), (86, 180, 233), (0, 158, 115),
-            (240, 228, 66), (0, 114, 178), (213, 94, 0),
-            (204, 121, 167), (128, 128, 128)
-        ]
-        for index, (bbox, score, label) in enumerate(zip(
-                instances.bboxes, instances.scores, instances.labels)):
-            x1, y1, x2, y2 = [int(round(value)) for value in bbox.tolist()]
-            x1 = max(0, min(x1, image_width - 1))
-            y1 = max(0, min(y1, image_height - 1))
-            x2 = max(0, min(x2, image_width - 1))
-            y2 = max(0, min(y2, image_height - 1))
-            label_index = int(label)
-            color = colors[label_index % len(colors)]
-            cv2.rectangle(bgr_image, (x1, y1), (x2, y2), color, 2)
-
-            label_name = (
-                label_names[index] if index < len(label_names)
-                else self.classes[label_index])
-            text = f'{label_name} {float(score):.2f}'
-            (text_width, text_height), baseline = cv2.getTextSize(
-                text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            text_y = max(y1, text_height + baseline + 2)
-            cv2.rectangle(
-                bgr_image,
-                (x1, text_y - text_height - baseline - 2),
-                (min(x1 + text_width + 4, image_width - 1), text_y + 2),
-                color, -1)
-            cv2.putText(
-                bgr_image, text, (x1 + 2, text_y - baseline),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
-                cv2.LINE_AA)
-
-            if 'keypoints' in instances:
-                points = instances.keypoints[index]
-                point_colors = [(255, 255, 255), (0, 0, 255),
-                                (0, 255, 0), (255, 0, 0)]
-                for point_index, point in enumerate(points):
-                    px = int(round(float(point[0]) * image_width))
-                    py = int(round(float(point[1]) * image_height))
-                    if 0 <= px < image_width and 0 <= py < image_height:
-                        radius = 8 if point_index == 0 else 4
-                        cv2.circle(
-                            bgr_image, (px, py), radius,
-                            point_colors[point_index % len(point_colors)], -1)
-                        if point_index == 0:
-                            cv2.circle(
-                                bgr_image, (px, py), radius, (0, 0, 0), 2)
-
-        iteration_dir = (
-            self.visualization_dir /
-            f'iter_{self.visualization_iteration:06d}')
-        iteration_dir.mkdir(parents=True, exist_ok=True)
-        output_path = iteration_dir / (
-            f'batch_{batch_index:02d}_view_{view_index:03d}_pred.jpg')
-        if not cv2.imwrite(str(output_path), bgr_image):
-            raise IOError(f'Failed to save visualization to {output_path}.')
-
-    def _save_gt_visualization(self, image, source_sample,
-                               batch_index: int, view_index: int) -> None:
-        if self.visualization_dir is None or not is_main_process():
-            return
-        image_height, image_width = self._image_shape(
-            source_sample, view_index, image.shape[-2:])
-        rgb_image = image[:, :image_height, :image_width]
-        rgb_image = rgb_image.permute(1, 2, 0).detach().cpu().numpy()
-        bgr_image = rgb_image.clip(0, 255).astype('uint8')[..., ::-1].copy()
-
-        gt_instances = source_sample.gt_instances_3d
-        gt_boxes = gt_instances.bboxes_2d
-        gt_points = gt_instances.keypoints_2d
-        gt_visible = getattr(gt_instances, 'keypoints_visible', None)
-        gt_box_visible = getattr(gt_instances, 'bboxes_2d_visible', None)
-        gt_labels = getattr(gt_instances, 'labels_3d', None)
-        if gt_boxes.ndim == 3:
-            gt_boxes = gt_boxes[:, view_index]
-        if gt_points.ndim == 4:
-            gt_points = gt_points[:, view_index]
-        if gt_visible is not None and gt_visible.ndim == 3:
-            gt_visible = gt_visible[:, view_index]
-        if gt_box_visible is not None and gt_box_visible.ndim == 2:
-            gt_box_visible = gt_box_visible[:, view_index]
-        scene_id = source_sample.metainfo.get(
-            'scene_id', source_sample.metainfo.get(
-                'sample_idx', source_sample.metainfo.get('scan_id', 'unknown')))
-        if isinstance(scene_id, (list, tuple)):
-            scene_id = scene_id[view_index]
-        for gt_index, bbox in enumerate(gt_boxes):
-            bbox_size = bbox[2:] - bbox[:2]
-            if (gt_box_visible is not None and
-                    not bool(gt_box_visible[gt_index])):
-                continue
-            if not bool(torch.isfinite(bbox).all()) or not bool(
-                    (bbox_size > 0).all()):
-                continue
-            coords = bbox * bbox.new_tensor(
-                [image_width, image_height, image_width, image_height])
-            x1, y1, x2, y2 = [int(round(float(value))) for value in coords]
-            cv2.rectangle(bgr_image, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            label_index = (int(gt_labels[gt_index])
-                           if gt_labels is not None else -1)
-            label_name = (self.classes[label_index]
-                          if 0 <= label_index < len(self.classes)
-                          else str(label_index))
-            text = f'GT {label_name} scene={scene_id}'
-            cv2.putText(bgr_image, text, (max(x1, 0), max(y1 - 5, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1,
-                        cv2.LINE_AA)
-            points = gt_points[gt_index]
-            point_mask = (gt_visible[gt_index].bool()
-                          if gt_visible is not None else
-                          torch.ones(len(points), dtype=torch.bool))
-            for point_index, (point, visible) in enumerate(
-                    zip(points, point_mask)):
-                if not bool(visible):
-                    continue
-                px = int(round(float(point[0]) * image_width))
-                py = int(round(float(point[1]) * image_height))
-                if 0 <= px < image_width and 0 <= py < image_height:
-                    is_center = point_index == len(points) - 1
-                    radius = 8 if is_center else 4
-                    color = (0, 0, 255) if is_center else (255, 0, 255)
-                    cv2.circle(bgr_image, (px, py), radius, color, -1)
-                    if is_center:
-                        cv2.circle(
-                            bgr_image, (px, py), radius, (0, 0, 0), 2)
-
-        iteration_dir = self.visualization_dir / (
-            f'iter_{self.visualization_iteration:06d}')
-        iteration_dir.mkdir(parents=True, exist_ok=True)
-        output_path = iteration_dir / (
-            f'batch_{batch_index:02d}_view_{view_index:03d}_gt.jpg')
-        if not cv2.imwrite(str(output_path), bgr_image):
-            raise IOError(f'Failed to save visualization to {output_path}.')
 
     def _make_training_samples(self, batch_data_samples, num_views,
                                padded_shape):
@@ -353,43 +193,10 @@ class GroundingDINOSemanticEncoder(nn.Module):
             normalized[:, :, :, image_width:] = 0
         return normalized
 
-    @torch.no_grad()
-    def _visualize_training_batch(self, images, batch_data_samples):
-        was_training = self.model.training
-        self.model.eval()
-        padded_shape = images.shape[-2:]
-        for batch_index, source_sample in enumerate(batch_data_samples):
-            for view_index in range(images.shape[1]):
-                image = images[batch_index, view_index]
-                data_sample = self._make_data_sample(
-                    source_sample, view_index, padded_shape)
-                prediction = self.model.predict(
-                    self._normalize_view(image, source_sample, view_index),
-                    [data_sample],
-                    rescale=False)[0]
-                self._save_gt_visualization(
-                    image, source_sample, batch_index, view_index)
-                self._save_visualization(
-                    image, prediction, source_sample, batch_index, view_index)
-
-        self.visualization_iteration += 1
-        if was_training:
-            self.model.train()
-            for module_name in ('backbone', 'neck', 'encoder',
-                                'language_model'):
-                module = getattr(self.model, module_name, None)
-                if module is not None:
-                    module.eval()
-
     def loss(self, images, batch_data_samples, vggt_feature_maps=None,
              return_reconstruction=False):
-        self.training_iteration += 1
         batch_size, num_views = images.shape[:2]
         padded_shape = images.shape[-2:]
-        if (self.visualization_dir is not None and
-                is_main_process() and
-                self.training_iteration % self.visualization_interval == 0):
-            self._visualize_training_batch(images, batch_data_samples)
 
         normalized = self._normalize_images(images, batch_data_samples)
         samples = self._make_training_samples(
@@ -442,10 +249,6 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 f'[GroundingDINO] batch={batch_index} view={view_index} '
                 f'score_thr={self.print_score_thr}: {output}',
                 flush=True)
-            self._save_visualization(
-                images[batch_index, view_index], prediction,
-                batch_data_samples[batch_index], batch_index, view_index)
-        self.visualization_iteration += 1
         if was_training:
             self.model.train()
             for module_name in ('backbone', 'neck', 'encoder',

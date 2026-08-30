@@ -693,6 +693,7 @@ class ReconGroundingDINO(DINO):
                 head_inputs_dict = self.forward_transformer(
                     copy.deepcopy(visual_feats), text_dict, batch_data_samples,
                     vggt_feature_maps=vggt_feature_maps)
+                head_inputs_dict.pop('reconstruction_hidden_states', None)
                 pred_instances = self.bbox_head.predict(
                     **head_inputs_dict,
                     rescale=rescale,
@@ -723,6 +724,7 @@ class ReconGroundingDINO(DINO):
             head_inputs_dict = self.forward_transformer(
                 visual_feats, text_dict, batch_data_samples,
                 vggt_feature_maps=vggt_feature_maps)
+            head_inputs_dict.pop('reconstruction_hidden_states', None)
             results_list = self.bbox_head.predict(
                 **head_inputs_dict,
                 rescale=rescale,

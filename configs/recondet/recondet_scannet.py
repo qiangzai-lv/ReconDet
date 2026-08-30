@@ -33,9 +33,6 @@ model = dict(
     grounding_dino_checkpoint=grounding_dino_checkpoint,
     semantic_classes=grounding_dino_classes,
     grounding_dino_print_score_thr=0.3,
-    grounding_dino_visualization_dir=(
-        'work_dirs/recondet_scannet/grounding_dino_vis'),
-    grounding_dino_visualization_interval=100,
     data_preprocessor=dict(
         type='VGGTDetDataPreprocessor',
         bgr_to_rgb=True,
@@ -131,7 +128,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=81,
+        n_images=128,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
