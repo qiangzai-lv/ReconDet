@@ -108,6 +108,8 @@ class ReconGroundingDINOHead(DINOHead):
         self.keypoint_loss_weight = kwargs.pop('keypoint_loss_weight', 1.0)
         self.center_loss_weight = kwargs.pop('center_loss_weight', 1.0)
         self.reconstruction_dims = kwargs.pop('reconstruction_dims', 512)
+        self.point_range = kwargs.pop(
+            'point_range', (-6.5, -9.0, -1.0, 6.5, 9.0, 4.5))
         self.point_3d_loss_weight = kwargs.pop('point_3d_loss_weight', 1.0)
         self.class_3d_loss_weight = kwargs.pop('class_3d_loss_weight', 1.0)
         self.keypoint_assigner = TASK_UTILS.build(
@@ -160,7 +162,8 @@ class ReconGroundingDINOHead(DINOHead):
         self._last_keypoint_outputs = None
         self.reconstruction_head = GroundingDINO3DHead(
             query_dims=self.reconstruction_dims,
-            semantic_dims=self.embed_dims)
+            semantic_dims=self.embed_dims,
+            point_range=self.point_range)
 
     def init_weights(self) -> None:
         """Initialize weights of the Deformable DETR head."""
@@ -465,6 +468,10 @@ class ReconGroundingDINOHead(DINOHead):
             masked_label_weights,
             avg_factor=cls_avg_factor)
 
+        point_min, point_max = self.reconstruction_head.point_range
+        point_targets = (point_targets - point_min) / (
+            point_max - point_min)
+        points_3d = (points_3d - point_min) / (point_max - point_min)
         point_error = (points_3d - point_targets).abs().mean(dim=-1)
         point_avg_factor = torch.clamp(
             reduce_mean(points_3d.new_tensor([num_total_pos])),

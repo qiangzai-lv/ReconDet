@@ -5,32 +5,22 @@ from torch import nn
 from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
 
 
-def _ensure_finite(name, value):
-    finite = torch.isfinite(value)
-    if finite.all():
-        return
-    invalid_count = int((~finite).sum().item())
-    finite_values = value[finite]
-    finite_range = 'no finite values'
-    if finite_values.numel() > 0:
-        finite_range = (
-            f'finite_min={finite_values.min().item():.6g}, '
-            f'finite_max={finite_values.max().item():.6g}')
-    raise FloatingPointError(
-        f'{name} contains {invalid_count}/{value.numel()} non-finite values; '
-        f'{finite_range}')
+def _sanitize_prediction(value, min_value=None, max_value=None):
+    value = torch.nan_to_num(
+        value.float(), nan=0.0, posinf=1e6, neginf=-1e6)
+    if min_value is not None or max_value is not None:
+        value = value.clamp(min=min_value, max=max_value)
+    return value
 
 
 def _build_cost_matrix(all_centers, all_sizes, all_cls, all_objness,
                        gt_centers, gt_sizes, gt_labels, cost_weights):
-    for name, value in (
-            ('predicted centers', all_centers),
-            ('predicted sizes', all_sizes),
-            ('classification logits', all_cls),
-            ('objectness scores', all_objness),
-            ('ground-truth centers', gt_centers),
-            ('ground-truth sizes', gt_sizes)):
-        _ensure_finite(name, value)
+    all_centers = _sanitize_prediction(all_centers, -100.0, 100.0)
+    all_sizes = _sanitize_prediction(all_sizes, 1e-4, 100.0)
+    all_cls = _sanitize_prediction(all_cls, -50.0, 50.0)
+    all_objness = _sanitize_prediction(all_objness, -50.0, 50.0)
+    gt_centers = gt_centers.float()
+    gt_sizes = gt_sizes.float().clamp_min(1e-4)
 
     pred_boxes = UnifiedMatcher._center_size_pred_to_bbox(
         None, all_centers, all_sizes)

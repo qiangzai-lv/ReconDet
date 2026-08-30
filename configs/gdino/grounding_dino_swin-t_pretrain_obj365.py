@@ -114,6 +114,7 @@ model = dict(
         reconstruction_dims=512,
         point_3d_loss_weight=6.0,
         class_3d_loss_weight=6.0,
+        point_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
         num_classes=256,
         sync_cls_avg_factor=True,
         contrastive_cfg=dict(max_text_len=256, log_scale='auto', bias=True),
