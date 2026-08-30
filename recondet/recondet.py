@@ -34,6 +34,7 @@ class ReconDet(Base3DDetector):
             position_embedding="fourier",
             if_mix_precision=False,
             if_save_vggt_feature=False,
+            enable_detection_loss=True,
             vggt_omega_checkpoint=None,
             grounding_dino_config=None,
             grounding_dino_checkpoint=None,
@@ -104,6 +105,7 @@ class ReconDet(Base3DDetector):
         )
         self.if_mix_precision = if_mix_precision
         self.if_save_vggt_feature = if_save_vggt_feature
+        self.enable_detection_loss = enable_detection_loss
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -176,8 +178,11 @@ class ReconDet(Base3DDetector):
         reconstruction_cls = reconstruction_cls.reshape(
             batch_size, num_views * reconstruction_cls.shape[1],
             reconstruction_cls.shape[2])
-        return self.scene_query_clustering(
-            reconstruction_points, reconstruction_hidden, reconstruction_cls)
+        cluster_xyz, cluster_query, cluster_scores = (
+            self.scene_query_clustering(
+                reconstruction_points, reconstruction_hidden,
+                reconstruction_cls))
+        return cluster_xyz.detach(), cluster_query.detach(), cluster_scores.detach()
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
                          images, batch_data_samples, query_xyz, query):
@@ -216,23 +221,24 @@ class ReconDet(Base3DDetector):
                 batch_data_samples,
                 vggt_feature_maps=vggt_feature_maps,
                 return_reconstruction=True))
-        query_xyz, query = self._cluster_reconstruction_queries(
-            reconstruction_hidden, reconstruction_outputs,
-            batch_inputs_dict['imgs'])[:2]
-        box_features, refined_query_xyz = self.get_box_features(
-            vggt_token_list, ps_idx, batch_inputs_dict, img,
-            batch_data_samples, query_xyz, query)
-        detection_losses = self.bbox_head.loss(
-            box_features,
-            batch_data_samples,
-            batch_inputs_dict,
-            refined_query_xyz=refined_query_xyz,
-            **kwargs)
         semantic_losses = self._format_gdino_losses(semantic_losses)
         losses = {f'gdino_{name}': value
                   for name, value in semantic_losses.items()}
-        losses.update({f'recondet_{name}': value
-                       for name, value in detection_losses.items()})
+        if self.enable_detection_loss:
+            query_xyz, query = self._cluster_reconstruction_queries(
+                reconstruction_hidden, reconstruction_outputs,
+                batch_inputs_dict['imgs'])[:2]
+            box_features, refined_query_xyz = self.get_box_features(
+                vggt_token_list, ps_idx, batch_inputs_dict, img,
+                batch_data_samples, query_xyz, query)
+            detection_losses = self.bbox_head.loss(
+                box_features,
+                batch_data_samples,
+                batch_inputs_dict,
+                refined_query_xyz=refined_query_xyz,
+                **kwargs)
+            losses.update({f'recondet_{name}': value
+                           for name, value in detection_losses.items()})
         return losses
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,

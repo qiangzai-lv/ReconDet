@@ -44,7 +44,9 @@ class WeightedFPSKMeans:
             center_scores = sample_scores[init_ids].clone()
 
             for _ in range(self.num_iterations):
-                distance = torch.cdist(sample_points, centers, p=2).square()
+                distance = (
+                    sample_points[:, None, :] - centers[None, :, :]).square()
+                distance = distance.sum(dim=-1)
                 assignment = distance.argmin(dim=1)
                 new_centers = []
                 new_queries = []
