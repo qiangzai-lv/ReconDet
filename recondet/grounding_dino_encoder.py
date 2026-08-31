@@ -21,10 +21,14 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  config: str,
                  checkpoint: str,
                  classes: Sequence[str],
-                 print_score_thr: float = 0.3) -> None:
+                 print_score_thr: float = 0.3,
+                 num_2d_loss_views: int = None) -> None:
         super().__init__()
         if not classes:
             raise ValueError('GroundingDINO classes must not be empty.')
+        if num_2d_loss_views is not None and num_2d_loss_views < 1:
+            raise ValueError('num_2d_loss_views must be positive or None.')
+        self.num_2d_loss_views = num_2d_loss_views
         config_path = Path(config).expanduser()
         if not config_path.is_absolute():
             config_path = Path.cwd() / config_path
@@ -200,11 +204,20 @@ class GroundingDINOSemanticEncoder(nn.Module):
                     batch_size * num_views, *feature.shape[2:]).contiguous()
                 for feature in vggt_feature_maps
             ]
+        loss_view_indices = None
+        if self.num_2d_loss_views is not None:
+            views_per_scene = min(num_views, self.num_2d_loss_views)
+            loss_view_indices = []
+            for batch_index in range(batch_size):
+                sampled_views = torch.randperm(num_views)[:views_per_scene]
+                loss_view_indices.extend(
+                    (sampled_views + batch_index * num_views).tolist())
         return self.model.loss(
             normalized,
             samples,
             vggt_feature_maps=flattened_vggt_features,
-            return_reconstruction=return_reconstruction)
+            return_reconstruction=return_reconstruction,
+            loss_view_indices=loss_view_indices)
 
     @torch.no_grad()
     def predict_and_print(self, images, batch_data_samples) -> None:

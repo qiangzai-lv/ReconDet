@@ -571,7 +571,8 @@ class ReconGroundingDINOHead(DINOHead):
              enc_outputs_class: Tensor, enc_outputs_coord: Tensor,
              batch_data_samples: SampleList, dn_meta: Dict[str, int],
              reconstruction_hidden_states: Tensor = None,
-             layer_ids: List[int] = None) -> dict:
+             layer_ids: List[int] = None,
+             loss_view_indices: List[int] = None) -> dict:
         """Perform forward propagation and loss calculation of the detection
         head on the queries of the upstream network.
 
@@ -614,8 +615,27 @@ class ReconGroundingDINOHead(DINOHead):
 
         outs = self(hidden_states, references, memory_text, text_token_mask)
         self.text_masks = text_token_mask
-        loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
-                              batch_gt_instances, batch_img_metas, dn_meta)
+
+        loss_cls_scores, loss_bbox_preds = outs
+        loss_enc_outputs_class = enc_outputs_class
+        loss_enc_outputs_coord = enc_outputs_coord
+        loss_gt_instances = batch_gt_instances
+        loss_img_metas = batch_img_metas
+        if loss_view_indices is not None:
+            loss_view_indices = torch.as_tensor(
+                loss_view_indices, device=loss_cls_scores.device,
+                dtype=torch.long)
+            loss_cls_scores = loss_cls_scores[:, loss_view_indices]
+            loss_bbox_preds = loss_bbox_preds[:, loss_view_indices]
+            loss_enc_outputs_class = enc_outputs_class[loss_view_indices]
+            loss_enc_outputs_coord = enc_outputs_coord[loss_view_indices]
+            loss_gt_instances = [batch_gt_instances[index]
+                                 for index in loss_view_indices.tolist()]
+            loss_img_metas = [batch_img_metas[index]
+                              for index in loss_view_indices.tolist()]
+        loss_inputs = (loss_cls_scores, loss_bbox_preds,
+                       loss_enc_outputs_class, loss_enc_outputs_coord,
+                       loss_gt_instances, loss_img_metas, dn_meta)
         if layer_ids is not None:
             original_layer_ids = self.loss_layer_ids
             self.loss_layer_ids = layer_ids

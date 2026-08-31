@@ -42,6 +42,7 @@ class ReconDet(Base3DDetector):
             semantic_classes=(),
             grounding_dino_print_score_thr=0.3,
             deformable_num_points=4,
+            num_2d_loss_views=None,
             enable_2d_loss=True
     ):
 
@@ -55,7 +56,8 @@ class ReconDet(Base3DDetector):
             config=grounding_dino_config,
             checkpoint=grounding_dino_checkpoint,
             classes=semantic_classes,
-            print_score_thr=grounding_dino_print_score_thr)
+            print_score_thr=grounding_dino_print_score_thr,
+            num_2d_loss_views=num_2d_loss_views)
 
         self.vggt_encoder = VGGTOmega()
         self.vggt_encoder.load_state_dict(

@@ -532,7 +532,8 @@ class ReconGroundingDINO(DINO):
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList, vggt_feature_maps=None,
-             return_reconstruction=False) -> Union[dict, list]:
+             return_reconstruction=False,
+             loss_view_indices=None) -> Union[dict, list]:
         text_prompts = [
             data_samples.text for data_samples in batch_data_samples
         ]
@@ -619,7 +620,8 @@ class ReconGroundingDINO(DINO):
         losses = self.bbox_head.loss(
             **head_inputs_dict,
             reconstruction_hidden_states=reconstruction_hidden_states,
-            batch_data_samples=batch_data_samples)
+            batch_data_samples=batch_data_samples,
+            loss_view_indices=loss_view_indices)
         if return_reconstruction:
             reconstruction_outputs = self.bbox_head.predict_reconstruction(
                 reconstruction_hidden_states,
