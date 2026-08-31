@@ -2,16 +2,15 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Sequence
 
-import cv2
 import torch
-from mmdet.registry import MODELS as MMDET_MODELS
-from mmdet.structures import DetDataSample
-from mmdet.utils import register_all_modules
 from mmengine.config import Config
-from mmengine.dist import is_main_process
 from mmengine.runner.checkpoint import CheckpointLoader, load_state_dict
 from mmengine.structures import InstanceData
 from torch import nn
+
+from mmdet.registry import MODELS as MMDET_MODELS
+from mmdet.structures import DetDataSample
+from mmdet.utils import register_all_modules
 
 
 class GroundingDINOSemanticEncoder(nn.Module):
@@ -166,19 +165,11 @@ class GroundingDINOSemanticEncoder(nn.Module):
                 valid &= torch.isfinite(bboxes).all(dim=-1)
                 valid &= (bbox_size > 0).all(dim=-1)
 
-                keypoints = source_instances.keypoints_2d
-                visible = source_instances.keypoints_visible
-                if keypoints.ndim == 4:
-                    keypoints = keypoints[:, view_index]
-                    visible = visible[:, view_index]
-
                 instances.labels = source_labels[valid].clone()
                 instances.bboxes_2d = bboxes[valid]
                 instances.bboxes = bboxes[valid] * bboxes.new_tensor(
                     [image_width, image_height, image_width, image_height])
-                instances.keypoints_2d = keypoints[valid]
-                instances.keypoints_visible = visible[valid]
-                instances.keypoints_3d = source_instances.keypoints_3d[valid]
+                instances.centers_3d = source_instances.centers_3d[valid]
                 sample.gt_instances = instances
                 samples.append(sample)
         return samples
@@ -194,7 +185,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
         return normalized
 
     def loss(self, images, batch_data_samples, vggt_feature_maps=None,
-             return_reconstruction=False):
+             return_reconstruction=False,
+             enable_3d_reconstruction_loss=True):
         batch_size, num_views = images.shape[:2]
         padded_shape = images.shape[-2:]
 
@@ -212,7 +204,8 @@ class GroundingDINOSemanticEncoder(nn.Module):
             normalized,
             samples,
             vggt_feature_maps=flattened_vggt_features,
-            return_reconstruction=return_reconstruction)
+            return_reconstruction=return_reconstruction,
+            enable_3d_reconstruction_loss=enable_3d_reconstruction_loss)
 
     @torch.no_grad()
     def predict_and_print(self, images, batch_data_samples) -> None:
@@ -259,7 +252,9 @@ class GroundingDINOSemanticEncoder(nn.Module):
 
     @torch.no_grad()
     def predict_reconstruction(self, images, batch_data_samples,
-                               vggt_feature_maps):
+                               vggt_feature_maps,
+                               return_predictions=False,
+                               return_reconstruction=True):
         padded_shape = images.shape[-2:]
         batch_size, num_views = images.shape[:2]
         flattened = self._normalize_images(images, batch_data_samples)
@@ -268,17 +263,26 @@ class GroundingDINOSemanticEncoder(nn.Module):
             for view_index in range(num_views):
                 samples.append(self._make_data_sample(
                     source_sample, view_index, padded_shape))
-        flattened_vggt_features = [
-            feature.reshape(
-                batch_size * num_views, *feature.shape[2:]).contiguous()
-            for feature in vggt_feature_maps
-        ]
+        flattened_vggt_features = None
+        if vggt_feature_maps is not None:
+            flattened_vggt_features = [
+                feature.reshape(
+                    batch_size * num_views, *feature.shape[2:]).contiguous()
+                for feature in vggt_feature_maps
+            ]
         was_training = self.model.training
         self.model.eval()
         self.model.predict(
             flattened, samples, rescale=False,
             vggt_feature_maps=flattened_vggt_features)
-        reconstruction_outputs = self.model._last_reconstruction_outputs
+        reconstruction_outputs = None
+        if return_reconstruction:
+            reconstruction_outputs = self.model._last_reconstruction_outputs
         if was_training:
             self.model.train()
+        if return_predictions:
+            predictions = [sample.pred_instances for sample in samples]
+            if not return_reconstruction:
+                return predictions
+            return reconstruction_outputs, predictions
         return reconstruction_outputs

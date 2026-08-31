@@ -55,7 +55,8 @@ class PackNeRFDetInputs(BaseTransform):
     ]
 
     INSTANCEDATA_3D_KEYS = [
-        'gt_bboxes_3d', 'gt_labels_3d', 'attr_labels', 'depths', 'centers_2d'
+        'gt_bboxes_3d', 'gt_labels_3d', 'attr_labels', 'depths', 'centers_2d',
+        'bboxes_2d', 'bboxes_2d_visible', 'centers_3d'
     ]
     INSTANCEDATA_2D_KEYS = [
         'gt_bboxes',

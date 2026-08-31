@@ -80,8 +80,12 @@ model = dict(
     num_queries=256,
     token_dim=_token_dim_,
     test_only_last_layer=True,
-    enable_detection_loss=True,
+    enable_3d_detection_loss=True,
+    enable_3d_reconstruction=True,
     enable_2d_loss=True,
+    loss_weight_2d_detection=0.5,
+    loss_weight_3d_point=2.0,
+    loss_weight_3d_bbox=1.0,
     if_mix_precision=True,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
@@ -115,7 +119,7 @@ train_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=42,
+        n_images=5,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -130,7 +134,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=128,
+        n_images=1,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -148,7 +152,7 @@ train_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type='RepeatDataset',
-        times=6,
+        times=1,
         dataset=dict(
             type=dataset_type,
             data_root=data_root,
@@ -178,13 +182,21 @@ val_dataloader = dict(
         metainfo=dict(CLASSES=class_names)))
 test_dataloader = val_dataloader
 
-val_evaluator = [dict(type='IndoorMetric')]
+val_evaluator = [
+    dict(type='IndoorMetric', prefix='3d'),
+    dict(type='Indoor2DMetric', iou_thr=[0.5], prefix='2d'),
+    dict(
+        type='ReconstructionMetric',
+        iou_thr=0.5,
+        distance_thresholds=(0.10, 0.25, 0.50),
+        prefix='recon_view'),
+]
 test_evaluator = val_evaluator
 
 # train cfg
 _warm_epoch = 0
 _max_epoch = 200
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=2)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval=1)
 test_cfg = dict()
 val_cfg = dict()
 
@@ -210,7 +222,12 @@ param_scheduler = [
 ]
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule="greater", interval=2, max_keep_ckpts=4),
+    checkpoint=dict(
+        type='CheckpointHook',
+        save_best=['2d/mAP_0.5'],
+        rule='greater',
+        interval=1,
+        max_keep_ckpts=4),
     logger=dict(type='LoggerHook', interval=10)
 )
 

@@ -1,6 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
-import itertools
 import math
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -12,7 +11,7 @@ from mmengine.structures import InstanceData
 from torch import Tensor
 
 from mmdet.models.losses import QualityFocalLoss
-from mmdet.registry import MODELS, TASK_UTILS
+from mmdet.registry import MODELS
 from mmdet.structures import SampleList
 from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
 from mmdet.utils import InstanceList, reduce_mean
@@ -105,21 +104,11 @@ class ReconGroundingDINOHead(DINOHead):
     def __init__(self, contrastive_cfg=dict(max_text_len=256), **kwargs):
         self.contrastive_cfg = contrastive_cfg
         self.max_text_len = contrastive_cfg.get('max_text_len', 256)
-        self.keypoint_loss_weight = kwargs.pop('keypoint_loss_weight', 1.0)
-        self.center_loss_weight = kwargs.pop('center_loss_weight', 1.0)
         self.reconstruction_dims = kwargs.pop('reconstruction_dims', 512)
         self.point_range = kwargs.pop(
             'point_range', (-6.5, -9.0, -1.0, 6.5, 9.0, 4.5))
         self.point_3d_loss_weight = kwargs.pop('point_3d_loss_weight', 1.0)
         self.class_3d_loss_weight = kwargs.pop('class_3d_loss_weight', 1.0)
-        self.keypoint_assigner = TASK_UTILS.build(
-            dict(
-                type='HungarianAssigner',
-                match_costs=[
-                    dict(type='BBoxL1Cost', weight=5.0,
-                         box_format='xyxy'),
-                    dict(type='IoUCost', iou_mode='giou', weight=2.0)
-                ]))
         super().__init__(**kwargs)
 
     def _init_layers(self) -> None:
@@ -131,12 +120,6 @@ class ReconGroundingDINOHead(DINOHead):
             reg_branch.append(nn.ReLU())
         reg_branch.append(Linear(self.embed_dims, 4))
         reg_branch = nn.Sequential(*reg_branch)
-        keypoint_branch = []
-        for _ in range(self.num_reg_fcs):
-            keypoint_branch.append(Linear(self.embed_dims, self.embed_dims))
-            keypoint_branch.append(nn.ReLU())
-        keypoint_branch.append(Linear(self.embed_dims, 8))
-        keypoint_branch = nn.Sequential(*keypoint_branch)
 
         # NOTE: due to the fc_cls is a contrastive embedding and don't
         # have any trainable parameters,we do not need to copy it.
@@ -151,15 +134,6 @@ class ReconGroundingDINOHead(DINOHead):
             self.reg_branches = nn.ModuleList([
                 copy.deepcopy(reg_branch) for _ in range(self.num_pred_layer)
             ])
-        if self.share_pred_layer:
-            self.keypoint_branches = nn.ModuleList(
-                [keypoint_branch for _ in range(self.num_pred_layer)])
-        else:
-            self.keypoint_branches = nn.ModuleList([
-                copy.deepcopy(keypoint_branch)
-                for _ in range(self.num_pred_layer)
-            ])
-        self._last_keypoint_outputs = None
         self.reconstruction_head = GroundingDINO3DHead(
             query_dims=self.reconstruction_dims,
             semantic_dims=self.embed_dims,
@@ -173,8 +147,6 @@ class ReconGroundingDINOHead(DINOHead):
         if self.as_two_stage:
             for m in self.reg_branches:
                 nn.init.constant_(m[-1].bias.data[2:], 0.0)
-        for m in self.keypoint_branches:
-            constant_init(m[-1], 0, bias=0)
 
     def _get_targets_single(self, cls_score: Tensor, bbox_pred: Tensor,
                             gt_instances: InstanceData,
@@ -289,7 +261,6 @@ class ReconGroundingDINOHead(DINOHead):
         """
         all_layers_outputs_classes = []
         all_layers_outputs_coords = []
-        all_layers_keypoints = []
 
         for layer_id in range(hidden_states.shape[0]):
             reference = inverse_sigmoid(references[layer_id])
@@ -311,87 +282,12 @@ class ReconGroundingDINOHead(DINOHead):
                 assert reference.shape[-1] == 2
                 tmp_reg_preds[..., :2] += reference
             outputs_coord = tmp_reg_preds.sigmoid()
-            tmp_keypoints = self.keypoint_branches[layer_id](hidden_state)
-            tmp_keypoints[..., :2] += reference[..., :2]
-            center = tmp_keypoints[..., :2].sigmoid()
-            offsets = tmp_keypoints[..., 2:].tanh().reshape(
-                *tmp_keypoints.shape[:-1], 3, 2)
-            points = (center.unsqueeze(-2) + offsets).clamp(0, 1)
             all_layers_outputs_classes.append(outputs_class)
             all_layers_outputs_coords.append(outputs_coord)
-            all_layers_keypoints.append(torch.cat(
-                [center.unsqueeze(-2), points], dim=-2))
 
         all_layers_outputs_classes = torch.stack(all_layers_outputs_classes)
         all_layers_outputs_coords = torch.stack(all_layers_outputs_coords)
-        self._last_keypoint_outputs = torch.stack(all_layers_keypoints)
-
         return all_layers_outputs_classes, all_layers_outputs_coords
-
-    def _keypoint_loss_single(self, keypoints, bbox_preds, gt_instances,
-                              img_meta):
-        if ('keypoints_2d' not in gt_instances or
-                'bboxes_2d' not in gt_instances):
-            return keypoints.sum() * 0, keypoints.sum() * 0
-        gt_bboxes = gt_instances.bboxes_2d
-        if gt_bboxes.ndim == 3:
-            gt_bboxes = gt_bboxes[:, 0]
-        img_h, img_w = img_meta['img_shape'][:2]
-        factor = gt_bboxes.new_tensor([img_w, img_h, img_w, img_h])
-        gt_bboxes = gt_bboxes * factor
-        if len(gt_bboxes) == 0:
-            return keypoints.sum() * 0, keypoints.sum() * 0
-
-        factor = bbox_preds.new_tensor([img_w, img_h, img_w, img_h])
-        pred_boxes = bbox_cxcywh_to_xyxy(bbox_preds) * factor
-        gt_labels = getattr(gt_instances, 'labels', None)
-        if gt_labels is None:
-            gt_labels = pred_boxes.new_zeros((len(gt_bboxes),), dtype=torch.long)
-        assign_result = self.keypoint_assigner.assign(
-            pred_instances=InstanceData(bboxes=pred_boxes),
-            gt_instances=InstanceData(bboxes=gt_bboxes, labels=gt_labels),
-            img_meta=img_meta)
-        pos_inds = torch.nonzero(
-            assign_result.gt_inds > 0, as_tuple=False).flatten()
-        if pos_inds.numel() == 0:
-            return keypoints.sum() * 0, keypoints.sum() * 0
-
-        center_losses = []
-        face_losses = []
-        gt_keypoints = gt_instances.keypoints_2d
-        if gt_keypoints.ndim == 4:
-            gt_keypoints = gt_keypoints[:, 0]
-        gt_visible = gt_instances.keypoints_visible.bool()
-        if gt_visible.ndim == 3:
-            gt_visible = gt_visible[:, 0]
-        for pred_index in pos_inds:
-            gt_index = int(assign_result.gt_inds[pred_index]) - 1
-            pred_center = keypoints[pred_index, 0]
-            target_center = gt_keypoints[gt_index, 6]
-            center_losses.append(torch.abs(pred_center - target_center).mean())
-
-            if self.keypoint_loss_weight > 0:
-                visible_faces = gt_keypoints[gt_index, :6][
-                    gt_visible[gt_index, :6]]
-                visible_faces = visible_faces[:3]
-                if visible_faces.numel() == 0:
-                    continue
-                predicted_faces = keypoints[pred_index, 1:]
-                costs = torch.cdist(predicted_faces, visible_faces, p=1)
-                num_faces = visible_faces.shape[0]
-                assignment_costs = []
-                for selected in itertools.permutations(range(3), num_faces):
-                    assignment_costs.append(
-                        costs[list(selected), torch.arange(
-                            num_faces, device=costs.device)].mean())
-                face_losses.append(torch.stack(assignment_costs).min())
-
-        zero = keypoints.sum() * 0
-        center_loss = (torch.stack(center_losses).mean()
-                       if center_losses else zero)
-        face_loss = (torch.stack(face_losses).mean()
-                     if face_losses else zero)
-        return center_loss, face_loss
 
     def _get_3d_targets_single(self, cls_score, bbox_pred, gt_instances,
                                img_meta):
@@ -417,8 +313,8 @@ class ReconGroundingDINOHead(DINOHead):
         point_weights = bbox_pred.new_zeros(bbox_pred.shape[0])
         if pos_inds.numel() > 0:
             labels[pos_inds] = gt_instances.positive_maps[assigned_gt_inds]
-            point_targets[pos_inds] = gt_instances.keypoints_3d[
-                assigned_gt_inds, 6]
+            point_targets[pos_inds] = gt_instances.centers_3d[
+                assigned_gt_inds]
             point_weights[pos_inds] = 1.0
         return (labels, label_weights, point_targets, point_weights,
                 pos_inds.numel(), neg_inds.numel())
@@ -496,33 +392,6 @@ class ReconGroundingDINOHead(DINOHead):
             all_layers_cls_scores, all_layers_bbox_preds, enc_cls_scores,
             enc_bbox_preds, batch_gt_instances, batch_img_metas, dn_meta,
             batch_gt_instances_ignore)
-        if self._last_keypoint_outputs is None:
-            return losses
-
-        keypoints = self._last_keypoint_outputs[-1]
-        bbox_preds = all_layers_bbox_preds[-1]
-        if dn_meta is not None:
-            num_dn = dn_meta['num_denoising_queries']
-            keypoints = keypoints[:, num_dn:]
-            bbox_preds = bbox_preds[:, num_dn:]
-        if keypoints.shape[1] != bbox_preds.shape[1]:
-            raise RuntimeError(
-                'Keypoint and bbox query counts must match after DN split: '
-                f'{keypoints.shape[1]} vs {bbox_preds.shape[1]}.')
-        center_losses, face_losses = [], []
-        for batch_index, (sample_keypoints, sample_bbox_preds,
-                          gt_instances, img_meta) in enumerate(zip(
-                              keypoints, bbox_preds, batch_gt_instances,
-                              batch_img_metas)):
-            center_loss, face_loss = self._keypoint_loss_single(
-                sample_keypoints, sample_bbox_preds, gt_instances, img_meta)
-            center_losses.append(center_loss)
-            face_losses.append(face_loss)
-        losses['loss_keypoint_center'] = self.center_loss_weight * torch.stack(
-            center_losses).mean()
-        if self.keypoint_loss_weight > 0:
-            losses['loss_keypoint_faces'] = (
-                self.keypoint_loss_weight * torch.stack(face_losses).mean())
         return losses
 
     def predict(self,
@@ -615,8 +484,6 @@ class ReconGroundingDINOHead(DINOHead):
         """
         cls_scores = all_layers_cls_scores[-1]
         bbox_preds = all_layers_bbox_preds[-1]
-        keypoint_preds = (self._last_keypoint_outputs[-1]
-                          if self._last_keypoint_outputs is not None else None)
         result_list = []
         for img_id in range(len(batch_img_metas)):
             cls_score = cls_scores[img_id]
@@ -625,9 +492,7 @@ class ReconGroundingDINOHead(DINOHead):
             token_positive_maps = batch_token_positive_maps[img_id]
             results = self._predict_by_feat_single(cls_score, bbox_pred,
                                                    token_positive_maps,
-                                                   img_meta, rescale,
-                                                   None if keypoint_preds is None
-                                                   else keypoint_preds[img_id])
+                                                   img_meta, rescale)
             result_list.append(results)
         return result_list
 
@@ -636,8 +501,7 @@ class ReconGroundingDINOHead(DINOHead):
                                 bbox_pred: Tensor,
                                 token_positive_maps: dict,
                                 img_meta: dict,
-                                rescale: bool = True,
-                                keypoint_pred: Optional[Tensor] = None) -> InstanceData:
+                                rescale: bool = True) -> InstanceData:
         """Transform a single image's features extracted from the head into
         bbox results.
 
@@ -677,15 +541,12 @@ class ReconGroundingDINOHead(DINOHead):
             det_labels = indexes % num_classes
             bbox_index = indexes // num_classes
             bbox_pred = bbox_pred[bbox_index]
-            if keypoint_pred is not None:
-                keypoint_pred = keypoint_pred[bbox_index]
         else:
             cls_score = cls_score.sigmoid()
             scores, _ = cls_score.max(-1)
             scores, indexes = scores.topk(max_per_img)
             bbox_pred = bbox_pred[indexes]
-            if keypoint_pred is not None:
-                keypoint_pred = keypoint_pred[indexes]
+            bbox_index = indexes
             det_labels = scores.new_zeros(scores.shape, dtype=torch.long)
 
         det_bboxes = bbox_cxcywh_to_xyxy(bbox_pred)
@@ -701,8 +562,7 @@ class ReconGroundingDINOHead(DINOHead):
         results.bboxes = det_bboxes
         results.scores = scores
         results.labels = det_labels
-        if keypoint_pred is not None:
-            results.keypoints = keypoint_pred
+        results.query_indices = bbox_index
         return results
 
     def loss(self, hidden_states: Tensor, references: List[Tensor],
@@ -780,7 +640,7 @@ class ReconGroundingDINOHead(DINOHead):
                 batch_img_metas,
                 self.cls_branches[hidden_states.shape[0] - 1])
             losses['loss_3d_cls'] = loss_3d_cls
-            losses['loss_3d_point'] = loss_3d_point
+            losses['loss_3d_point'] = loss_3d_point * 10
         return losses
 
     def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,

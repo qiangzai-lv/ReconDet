@@ -109,8 +109,6 @@ model = dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
         type='ReconGroundingDINOHead',
-        center_loss_weight=1.0,
-        keypoint_loss_weight=0.0,
         reconstruction_dims=512,
         point_3d_loss_weight=6.0,
         class_3d_loss_weight=6.0,
