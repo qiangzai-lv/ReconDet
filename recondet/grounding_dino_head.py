@@ -621,6 +621,7 @@ class ReconGroundingDINOHead(DINOHead):
         loss_enc_outputs_coord = enc_outputs_coord
         loss_gt_instances = batch_gt_instances
         loss_img_metas = batch_img_metas
+        full_text_masks = self.text_masks
         if loss_view_indices is not None:
             loss_view_indices = torch.as_tensor(
                 loss_view_indices, device=loss_cls_scores.device,
@@ -633,6 +634,7 @@ class ReconGroundingDINOHead(DINOHead):
                                  for index in loss_view_indices.tolist()]
             loss_img_metas = [batch_img_metas[index]
                               for index in loss_view_indices.tolist()]
+            self.text_masks = self.text_masks[loss_view_indices]
         loss_inputs = (loss_cls_scores, loss_bbox_preds,
                        loss_enc_outputs_class, loss_enc_outputs_coord,
                        loss_gt_instances, loss_img_metas, dn_meta)
@@ -643,6 +645,7 @@ class ReconGroundingDINOHead(DINOHead):
             self.loss_layer_ids = original_layer_ids
         else:
             losses = self.loss_by_feat(*loss_inputs)
+        self.text_masks = full_text_masks
         if reconstruction_hidden_states is not None:
             cls_scores_2d, bbox_preds_2d = outs
             cls_scores_2d = cls_scores_2d[-1]
