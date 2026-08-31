@@ -3,6 +3,7 @@ from collections import OrderedDict
 from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
+import torch
 from mmdet.evaluation import eval_map
 from mmengine.evaluator import BaseMetric
 from mmengine.logging import MMLogger
@@ -75,6 +76,22 @@ class IndoorMetric(BaseMetric):
             ann_infos.append(eval_ann)
             pred_results.append(sinlge_pred_results)
 
+        # ``indoor_eval`` cannot format AP tables when every prediction is
+        # empty. This is expected when 3D detection is intentionally disabled
+        # while evaluating the 2D branch.
+        if pred_results and all(
+                len(pred.get('scores_3d', ())) == 0
+                for pred in pred_results):
+            empty_metrics = {}
+            for iou_thr in self.iou_thr:
+                suffix = f'{iou_thr:.2f}'
+                for class_name in self.dataset_meta['classes']:
+                    empty_metrics[f'{class_name}_AP_{suffix}'] = 0.0
+                    empty_metrics[f'{class_name}_rec_{suffix}'] = 0.0
+                empty_metrics[f'mAP_{suffix}'] = 0.0
+                empty_metrics[f'mAR_{suffix}'] = 0.0
+            return empty_metrics
+
         # some checkpoints may not record the key "box_type_3d"
         box_type_3d, box_mode_3d = get_box_type(
             self.dataset_meta.get('box_type_3d', 'depth'))
@@ -126,10 +143,47 @@ class Indoor2DMetric(BaseMetric):
         """
         for data_sample in data_samples:
             pred = data_sample['pred_instances']
-            eval_ann_info = data_sample['eval_ann_info']
+            gt_instances = data_sample['gt_instances_3d']
+            if isinstance(gt_instances, dict):
+                gt_bboxes = gt_instances['bboxes_2d']
+                gt_labels = gt_instances['labels_3d']
+                gt_visible = gt_instances['bboxes_2d_visible']
+            else:
+                gt_bboxes = gt_instances.bboxes_2d
+                gt_labels = gt_instances.labels_3d
+                gt_visible = gt_instances.bboxes_2d_visible
+            if gt_bboxes.ndim == 2:
+                gt_bboxes = gt_bboxes[:, None]
+            if gt_visible.ndim == 1:
+                gt_visible = gt_visible[:, None]
+            num_views = gt_bboxes.shape[1]
+            if isinstance(data_sample, dict):
+                metainfo = data_sample.get('metainfo', data_sample)
+            else:
+                metainfo = data_sample.metainfo
+            image_shape = metainfo.get(
+                'img_shape', metainfo.get('batch_input_shape'))
+            if isinstance(image_shape[0], (list, tuple)):
+                image_shapes = image_shape
+            else:
+                image_shapes = [image_shape] * num_views
+
+            valid_boxes, valid_labels = [], []
+            for view_id in range(num_views):
+                boxes = gt_bboxes[:, view_id]
+                visible = gt_visible[:, view_id].bool()
+                height, width = image_shapes[view_id][:2]
+                boxes = boxes * boxes.new_tensor([width, height, width, height])
+                valid = visible & torch.isfinite(boxes).all(dim=-1)
+                valid &= (boxes[:, 2:] > boxes[:, :2]).all(dim=-1)
+                valid &= gt_labels >= 0
+                valid_boxes.append(boxes[valid])
+                valid_labels.append(gt_labels[valid])
             ann = dict(
-                labels=eval_ann_info['gt_bboxes_labels'],
-                bboxes=eval_ann_info['gt_bboxes'])
+                labels=(torch.cat(valid_labels) if valid_labels else
+                        gt_labels[:0]).cpu().numpy(),
+                bboxes=(torch.cat(valid_boxes) if valid_boxes else
+                        gt_bboxes.new_zeros((0, 4))).cpu().numpy())
 
             pred_bboxes = pred['bboxes'].cpu().numpy()
             pred_scores = pred['scores'].cpu().numpy()
