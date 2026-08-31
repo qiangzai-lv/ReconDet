@@ -541,12 +541,13 @@ class ReconGroundingDINOHead(DINOHead):
             det_labels = indexes % num_classes
             bbox_index = indexes // num_classes
             bbox_pred = bbox_pred[bbox_index]
+            query_indices = bbox_index
         else:
             cls_score = cls_score.sigmoid()
             scores, _ = cls_score.max(-1)
             scores, indexes = scores.topk(max_per_img)
             bbox_pred = bbox_pred[indexes]
-            bbox_index = indexes
+            query_indices = indexes
             det_labels = scores.new_zeros(scores.shape, dtype=torch.long)
 
         det_bboxes = bbox_cxcywh_to_xyxy(bbox_pred)
@@ -562,7 +563,7 @@ class ReconGroundingDINOHead(DINOHead):
         results.bboxes = det_bboxes
         results.scores = scores
         results.labels = det_labels
-        results.query_indices = bbox_index
+        results.query_indices = query_indices
         return results
 
     def loss(self, hidden_states: Tensor, references: List[Tensor],

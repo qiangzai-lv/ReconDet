@@ -35,15 +35,14 @@ class ReconDet(Base3DDetector):
             position_embedding="fourier",
             if_mix_precision=False,
             if_save_vggt_feature=False,
+            enable_detection_loss=True,
             vggt_omega_checkpoint=None,
             grounding_dino_config=None,
             grounding_dino_checkpoint=None,
             semantic_classes=(),
             grounding_dino_print_score_thr=0.3,
             deformable_num_points=4,
-            loss_weight_2d_detection=1.0,
-            loss_weight_3d_reconstruction=1.0,
-            loss_weight_3d_detection=1.0
+            enable_2d_loss=True
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -108,9 +107,8 @@ class ReconDet(Base3DDetector):
         )
         self.if_mix_precision = if_mix_precision
         self.if_save_vggt_feature = if_save_vggt_feature
-        self.loss_weight_2d_detection = loss_weight_2d_detection
-        self.loss_weight_3d_reconstruction = loss_weight_3d_reconstruction
-        self.loss_weight_3d_detection = loss_weight_3d_detection
+        self.enable_detection_loss = enable_detection_loss
+        self.enable_2d_loss = enable_2d_loss
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -155,54 +153,34 @@ class ReconDet(Base3DDetector):
         return torch.stack(extrinsics), torch.stack(intrinsics)
 
     @staticmethod
-    def _merge_gdino_log_vars(log_vars):
+    def _format_gdino_losses(losses):
         aggregated = {}
         passthrough = {}
-        for name, value in log_vars.items():
-            if not name.startswith('gdino_'):
-                passthrough[name] = value
-                continue
-            loss_name = name[len('gdino_'):]
-            normalized_name = loss_name
-            if loss_name.startswith('d') and '.' in loss_name:
-                layer_name, loss_name = loss_name.split('.', 1)
+        for name, value in losses.items():
+            if name.startswith('d') and '.' in name:
+                layer_name, loss_name = name.split('.', 1)
                 if layer_name[1:].isdigit():
-                    normalized_name = loss_name
-            for prefix in ('dn_', 'enc_'):
-                if normalized_name.startswith(prefix):
-                    normalized_name = normalized_name[len(prefix):]
-                    break
-            if normalized_name != loss_name or normalized_name in {
-                    'loss_cls', 'loss_bbox', 'loss_iou'}:
-                aggregated.setdefault(normalized_name, []).append(value)
-            else:
-                passthrough[f'gdino_{loss_name}'] = value
+                    aggregated.setdefault(loss_name, []).append(value)
+                    continue
+            passthrough[name] = value
 
         formatted = dict(passthrough)
         for name, values in aggregated.items():
-            # Loss implementations may return scalar tensors or one-element
-            # tensors depending on whether the branch has positives.
-            formatted[f'gdino_{name}'] = torch.stack([
-                value.reshape(-1).sum() for value in values
-            ]).sum()
+            formatted[name] = torch.stack(values).sum()
         return formatted
 
-    def parse_losses(self, losses):
-        """Keep optimization losses unchanged and merge only log values."""
-        parsed_loss, log_vars = super().parse_losses(losses)
-        return parsed_loss, self._merge_gdino_log_vars(log_vars)
-
-    def _apply_loss_group_weights(self, losses):
-        weighted = {}
-        for name, value in losses.items():
-            if name.startswith('recondet_'):
-                weight = self.loss_weight_3d_detection
-            elif name.startswith('gdino_loss_3d_'):
-                weight = self.loss_weight_3d_reconstruction
-            else:
-                weight = self.loss_weight_2d_detection
-            weighted[name] = value * weight
-        return weighted
+    @staticmethod
+    def _remove_2d_losses(losses):
+        """Remove Grounding DINO 2D box and keypoint supervision losses."""
+        removed_names = {
+            'loss_cls', 'loss_bbox', 'loss_iou',
+            'loss_keypoint_center', 'loss_keypoint_faces',
+        }
+        return {
+            name: value for name, value in losses.items()
+            if (name.split('.', 1)[-1] not in removed_names and
+                not name.startswith(('dn_loss_', 'enc_loss_')))
+        }
 
     def _cluster_reconstruction_queries(self, reconstruction_hidden,
                                         reconstruction_outputs, images):
@@ -259,23 +237,27 @@ class ReconDet(Base3DDetector):
                 batch_data_samples,
                 vggt_feature_maps=vggt_feature_maps,
                 return_reconstruction=True))
+        semantic_losses = self._format_gdino_losses(semantic_losses)
+        if not self.enable_2d_loss:
+            semantic_losses = self._remove_2d_losses(semantic_losses)
         losses = {f'gdino_{name}': value
                   for name, value in semantic_losses.items()}
-        query_xyz, query = self._cluster_reconstruction_queries(
-            reconstruction_hidden, reconstruction_outputs,
-            batch_inputs_dict['imgs'])[:2]
-        box_features, refined_query_xyz = self.get_box_features(
-            vggt_token_list, ps_idx, batch_inputs_dict, img,
-            batch_data_samples, query_xyz, query)
-        detection_losses = self.bbox_head.loss(
-            box_features,
-            batch_data_samples,
-            batch_inputs_dict,
-            refined_query_xyz=refined_query_xyz,
-            **kwargs)
-        losses.update({f'recondet_{name}': value
-                       for name, value in detection_losses.items()})
-        return self._apply_loss_group_weights(losses)
+        if self.enable_detection_loss:
+            query_xyz, query = self._cluster_reconstruction_queries(
+                reconstruction_hidden, reconstruction_outputs,
+                batch_inputs_dict['imgs'])[:2]
+            box_features, refined_query_xyz = self.get_box_features(
+                vggt_token_list, ps_idx, batch_inputs_dict, img,
+                batch_data_samples, query_xyz, query)
+            detection_losses = self.bbox_head.loss(
+                box_features,
+                batch_data_samples,
+                batch_inputs_dict,
+                refined_query_xyz=refined_query_xyz,
+                **kwargs)
+            losses.update({f'recondet_{name}': value
+                           for name, value in detection_losses.items()})
+        return losses
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:
@@ -285,9 +267,7 @@ class ReconDet(Base3DDetector):
         reconstruction_outputs, view_predictions = (
             self.semantic_encoder.predict_reconstruction(
                 batch_inputs_dict['imgs'], batch_data_samples,
-                self.feature_projector(vggt_token_list, img, ps_idx),
-                return_predictions=True))
-        reconstruction_points = reconstruction_outputs[1]
+                self.feature_projector(vggt_token_list, img, ps_idx)))
         reconstruction_hidden = (
             self.semantic_encoder.model._last_reconstruction_hidden_states)
         query_xyz, query = self._cluster_reconstruction_queries(
@@ -308,25 +288,56 @@ class ReconDet(Base3DDetector):
             refined_query_xyz=refined_query_xyz,
             layer_ids=layer_ids,
             **kwargs)
+        num_views = batch_inputs_dict['imgs'].shape[1]
+        batch_size = len(batch_data_samples)
+        # Detection queries are scene-level. Repeat their final 3D locations
+        # for each view so query_indices and reconstruction points share the
+        # same index space expected by the view-level metric.
+        reconstruction_points = refined_query_xyz[-1].detach()
+        reconstruction_points = reconstruction_points.repeat_interleave(
+            num_views, dim=0)
+        if len(view_predictions) != batch_size * num_views:
+            raise ValueError(
+                'Unexpected 2D prediction count: '
+                f'{len(view_predictions)} for batch={batch_size}, '
+                f'views={num_views}')
+
         scene_2d_predictions = []
-        scene_reconstruction_predictions = []
         scene_view_predictions = []
-        for batch_index in range(len(batch_data_samples)):
-            start = batch_index * batch_inputs_dict['imgs'].shape[1]
-            end = start + batch_inputs_dict['imgs'].shape[1]
+        scene_reconstruction_predictions = []
+        for batch_index, data_sample in enumerate(batch_data_samples):
+            start = batch_index * num_views
+            end = start + num_views
             view_predictions_for_scene = view_predictions[start:end]
-            scene_view_predictions.append(view_predictions_for_scene)
-            scene_2d_predictions.append(InstanceData.cat(view_predictions_for_scene))
+            normalized_view_predictions = []
+            for prediction in view_predictions_for_scene:
+                if hasattr(prediction, 'pred_instances'):
+                    prediction = prediction.pred_instances
+                normalized_view_predictions.append(
+                    InstanceData(
+                        bboxes=prediction.bboxes,
+                        scores=prediction.scores,
+                        labels=prediction.labels,
+                        query_indices=prediction.query_indices))
+            scene_view_predictions.append(normalized_view_predictions)
+            scene_2d_predictions.append(
+                InstanceData.cat(normalized_view_predictions))
             scene_reconstruction_predictions.append([
                 InstanceData(points_3d=points)
                 for points in reconstruction_points[start:end]
             ])
-            batch_data_samples[batch_index].pred_instances_2d_views = \
-                view_predictions_for_scene
-            batch_data_samples[batch_index].pred_reconstruction = \
+            data_sample.pred_instances_2d_views = normalized_view_predictions
+            data_sample.pred_reconstruction = \
                 scene_reconstruction_predictions[-1]
         predictions = self.add_pred_to_datasample(
             batch_data_samples, results_list, scene_2d_predictions)
+        for data_sample, prediction, view_predictions_for_scene, \
+                reconstruction_for_scene in zip(
+                    predictions, scene_2d_predictions, scene_view_predictions,
+                    scene_reconstruction_predictions):
+            data_sample.pred_instances = prediction
+            data_sample.pred_instances_2d_views = view_predictions_for_scene
+            data_sample.pred_reconstruction = reconstruction_for_scene
         return predictions
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,

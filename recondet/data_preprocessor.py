@@ -97,8 +97,9 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                     if 'bboxes_3d' not in instances:
                         continue
                     boxes = instances.bboxes_3d
+                    instances.centers_3d = boxes.gravity_center
                     metadata = data_sample.metainfo
-                    projected = self.bbox_keypoint_projector(
+                    keypoints = self.bbox_keypoint_projector(
                         centers=boxes.gravity_center,
                         dimensions=boxes.dims,
                         extrinsics=metadata['lidar2img']['extrinsic'],
@@ -106,9 +107,11 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                         scale_factor=metadata['scale_factor'],
                         image_shape=batch_input_shape,
                         valid_image_shape=metadata['img_shape'])
-                    instances.centers_3d = boxes.gravity_center
-                    instances.bboxes_2d = projected[3]
-                    instances.bboxes_2d_visible = projected[4]
+                    instances.keypoints_3d = keypoints[0]
+                    instances.keypoints_2d = keypoints[1]
+                    instances.keypoints_visible = keypoints[2]
+                    instances.bboxes_2d = keypoints[3]
+                    instances.bboxes_2d_visible = keypoints[4]
 
                 if self.boxtype2tensor:
                     samplelist_boxtype2tensor(data_samples)

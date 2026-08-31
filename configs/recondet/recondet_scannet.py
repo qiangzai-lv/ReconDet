@@ -80,9 +80,8 @@ model = dict(
     num_queries=256,
     token_dim=_token_dim_,
     test_only_last_layer=True,
-    loss_weight_2d_detection=0.0,
-    loss_weight_3d_reconstruction=1.0,
-    loss_weight_3d_detection=1.0,
+    enable_detection_loss=True,
+    enable_2d_loss=False,
     if_mix_precision=True,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
