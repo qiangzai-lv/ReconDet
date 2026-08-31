@@ -40,7 +40,10 @@ class ReconDet(Base3DDetector):
             grounding_dino_checkpoint=None,
             semantic_classes=(),
             grounding_dino_print_score_thr=0.3,
-            deformable_num_points=4
+            deformable_num_points=4,
+            loss_weight_2d_detection=1.0,
+            loss_weight_3d_reconstruction=1.0,
+            loss_weight_3d_detection=1.0
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -105,6 +108,9 @@ class ReconDet(Base3DDetector):
         )
         self.if_mix_precision = if_mix_precision
         self.if_save_vggt_feature = if_save_vggt_feature
+        self.loss_weight_2d_detection = loss_weight_2d_detection
+        self.loss_weight_3d_reconstruction = loss_weight_3d_reconstruction
+        self.loss_weight_3d_detection = loss_weight_3d_detection
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -186,6 +192,18 @@ class ReconDet(Base3DDetector):
         parsed_loss, log_vars = super().parse_losses(losses)
         return parsed_loss, self._merge_gdino_log_vars(log_vars)
 
+    def _apply_loss_group_weights(self, losses):
+        weighted = {}
+        for name, value in losses.items():
+            if name.startswith('recondet_'):
+                weight = self.loss_weight_3d_detection
+            elif name.startswith('gdino_loss_3d_'):
+                weight = self.loss_weight_3d_reconstruction
+            else:
+                weight = self.loss_weight_2d_detection
+            weighted[name] = value * weight
+        return weighted
+
     def _cluster_reconstruction_queries(self, reconstruction_hidden,
                                         reconstruction_outputs, images):
         reconstruction_cls, reconstruction_points = reconstruction_outputs
@@ -257,7 +275,7 @@ class ReconDet(Base3DDetector):
             **kwargs)
         losses.update({f'recondet_{name}': value
                        for name, value in detection_losses.items()})
-        return losses
+        return self._apply_loss_group_weights(losses)
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:

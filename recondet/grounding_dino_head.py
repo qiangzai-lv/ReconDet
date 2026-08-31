@@ -640,7 +640,7 @@ class ReconGroundingDINOHead(DINOHead):
                 batch_img_metas,
                 self.cls_branches[hidden_states.shape[0] - 1])
             losses['loss_3d_cls'] = loss_3d_cls
-            losses['loss_3d_point'] = loss_3d_point * 10
+            losses['loss_3d_point'] = loss_3d_point
         return losses
 
     def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,
