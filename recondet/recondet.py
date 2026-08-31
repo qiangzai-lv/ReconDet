@@ -35,18 +35,12 @@ class ReconDet(Base3DDetector):
             position_embedding="fourier",
             if_mix_precision=False,
             if_save_vggt_feature=False,
-            enable_3d_detection_loss=True,
-            enable_3d_reconstruction=True,
             vggt_omega_checkpoint=None,
             grounding_dino_config=None,
             grounding_dino_checkpoint=None,
             semantic_classes=(),
             grounding_dino_print_score_thr=0.3,
-            deformable_num_points=4,
-            enable_2d_loss=True,
-            loss_weight_2d_detection=1.0,
-            loss_weight_3d_point=1.0,
-            loss_weight_3d_bbox=1.0
+            deformable_num_points=4
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -111,14 +105,6 @@ class ReconDet(Base3DDetector):
         )
         self.if_mix_precision = if_mix_precision
         self.if_save_vggt_feature = if_save_vggt_feature
-        self.enable_3d_detection_loss = enable_3d_detection_loss
-        self.enable_3d_reconstruction = enable_3d_reconstruction
-        self.enable_3d = (self.enable_3d_reconstruction
-                          and self.enable_3d_detection_loss)
-        self.enable_2d_loss = enable_2d_loss
-        self.loss_weight_2d_detection = loss_weight_2d_detection
-        self.loss_weight_3d_point = loss_weight_3d_point
-        self.loss_weight_3d_bbox = loss_weight_3d_bbox
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -200,28 +186,6 @@ class ReconDet(Base3DDetector):
         parsed_loss, log_vars = super().parse_losses(losses)
         return parsed_loss, self._merge_gdino_log_vars(log_vars)
 
-    @staticmethod
-    def _remove_2d_losses(losses):
-        """Remove Grounding DINO 2D box and keypoint supervision losses."""
-        removed_names = {
-            'loss_cls', 'loss_bbox', 'loss_iou',
-            'loss_keypoint_center', 'loss_keypoint_faces',
-        }
-        return {
-            name: value for name, value in losses.items()
-            if (name.split('.', 1)[-1] not in removed_names and
-                not name.startswith(('dn_loss_', 'enc_loss_')))
-        }
-
-    def _weight_semantic_losses(self, losses):
-        weighted = {}
-        for name, value in losses.items():
-            weight = (self.loss_weight_3d_point
-                      if name.startswith('loss_3d_')
-                      else self.loss_weight_2d_detection)
-            weighted[name] = value * weight
-        return weighted
-
     def _cluster_reconstruction_queries(self, reconstruction_hidden,
                                         reconstruction_outputs, images):
         reconstruction_cls, reconstruction_points = reconstruction_outputs
@@ -239,24 +203,6 @@ class ReconDet(Base3DDetector):
                 reconstruction_points, reconstruction_hidden,
                 reconstruction_cls))
         return cluster_xyz.detach(), cluster_query.detach(), cluster_scores.detach()
-
-    @staticmethod
-    def _empty_3d_prediction(data_sample, device):
-        """Build an empty 3D result while preserving the MMDet3D API."""
-        box_type_3d = data_sample.metainfo.get('box_type_3d')
-        if box_type_3d is None:
-            raise KeyError('data sample metainfo must contain box_type_3d')
-        bboxes_3d = box_type_3d(
-            torch.empty((0, 6), device=device),
-            box_dim=6,
-            with_yaw=False,
-            origin=(.5, .5, .5))
-        prediction = InstanceData()
-        prediction.bboxes_3d = bboxes_3d
-        prediction.scores_3d = torch.empty((0,), device=device)
-        prediction.labels_3d = torch.empty(
-            (0,), dtype=torch.long, device=device)
-        return prediction
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
                          images, batch_data_samples, query_xyz, query):
@@ -285,100 +231,65 @@ class ReconDet(Base3DDetector):
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
-        if self.enable_3d_reconstruction:
-            vggt_token_list, ps_idx, img = self.extract_feat(
-                batch_inputs_dict, batch_data_samples, 'train')
-            vggt_feature_maps = self.feature_projector(
-                vggt_token_list, img, ps_idx)
-            semantic_losses, reconstruction_hidden, reconstruction_outputs = (
-                self.semantic_encoder.loss(
-                    batch_inputs_dict['imgs'],
-                    batch_data_samples,
-                    vggt_feature_maps=vggt_feature_maps,
-                    return_reconstruction=True,
-                    enable_3d_reconstruction_loss=True))
-        else:
-            semantic_losses = self.semantic_encoder.loss(
+        vggt_token_list, ps_idx, img = self.extract_feat(
+            batch_inputs_dict, batch_data_samples, 'train')
+        vggt_feature_maps = self.feature_projector(
+            vggt_token_list, img, ps_idx)
+        semantic_losses, reconstruction_hidden, reconstruction_outputs = (
+            self.semantic_encoder.loss(
                 batch_inputs_dict['imgs'],
                 batch_data_samples,
-                vggt_feature_maps=None,
-                return_reconstruction=False)
-        if not self.enable_2d_loss:
-            semantic_losses = self._remove_2d_losses(semantic_losses)
-        semantic_losses = self._weight_semantic_losses(semantic_losses)
+                vggt_feature_maps=vggt_feature_maps,
+                return_reconstruction=True))
         losses = {f'gdino_{name}': value
                   for name, value in semantic_losses.items()}
-        if self.enable_3d_detection_loss and self.enable_3d_reconstruction:
-            query_xyz, query = self._cluster_reconstruction_queries(
-                reconstruction_hidden, reconstruction_outputs,
-                batch_inputs_dict['imgs'])[:2]
-            box_features, refined_query_xyz = self.get_box_features(
-                vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples, query_xyz, query)
-            detection_losses = self.bbox_head.loss(
-                box_features,
-                batch_data_samples,
-                batch_inputs_dict,
-                refined_query_xyz=refined_query_xyz,
-                **kwargs)
-            losses.update({f'recondet_{name}': value
-                           for name, value in detection_losses.items()})
-            losses = {
-                name: (value * self.loss_weight_3d_bbox
-                       if name.startswith('recondet_') else value)
-                for name, value in losses.items()
-            }
+        query_xyz, query = self._cluster_reconstruction_queries(
+            reconstruction_hidden, reconstruction_outputs,
+            batch_inputs_dict['imgs'])[:2]
+        box_features, refined_query_xyz = self.get_box_features(
+            vggt_token_list, ps_idx, batch_inputs_dict, img,
+            batch_data_samples, query_xyz, query)
+        detection_losses = self.bbox_head.loss(
+            box_features,
+            batch_data_samples,
+            batch_inputs_dict,
+            refined_query_xyz=refined_query_xyz,
+            **kwargs)
+        losses.update({f'recondet_{name}': value
+                       for name, value in detection_losses.items()})
         return losses
 
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:
 
-        if self.enable_3d_reconstruction:
-            vggt_token_list, ps_idx, img = self.extract_feat(
-                batch_inputs_dict, batch_data_samples, 'test')
-            reconstruction_outputs, view_predictions = (
-                self.semantic_encoder.predict_reconstruction(
-                    batch_inputs_dict['imgs'], batch_data_samples,
-                    self.feature_projector(vggt_token_list, img, ps_idx),
-                    return_predictions=True))
-            reconstruction_points = reconstruction_outputs[1]
-            if self.enable_3d_detection_loss:
-                reconstruction_hidden = (
-                    self.semantic_encoder.model._last_reconstruction_hidden_states)
-                query_xyz, query = self._cluster_reconstruction_queries(
-                    reconstruction_hidden, reconstruction_outputs,
-                    batch_inputs_dict['imgs'])[:2]
-                box_features, refined_query_xyz = self.get_box_features(
-                    vggt_token_list, ps_idx, batch_inputs_dict, img,
-                    batch_data_samples, query_xyz, query)
-                layer_ids = list(range(len(box_features)))
-                if self.test_only_last_layer:
-                    box_features = [box_features[-1]]
-                    refined_query_xyz = [refined_query_xyz[-1]]
-                    layer_ids = [layer_ids[-1]]
-                results_list = self.bbox_head.predict(
-                    box_features,
-                    batch_data_samples,
-                    batch_inputs_dict,
-                    refined_query_xyz=refined_query_xyz,
-                    layer_ids=layer_ids,
-                    **kwargs)
-            else:
-                device = batch_inputs_dict['imgs'].device
-                results_list = [
-                    self._empty_3d_prediction(data_sample, device)
-                    for data_sample in batch_data_samples
-                ]
-        else:
-            view_predictions = self.semantic_encoder.predict_reconstruction(
-                batch_inputs_dict['imgs'], batch_data_samples, None,
-                return_predictions=True, return_reconstruction=False)
-            device = batch_inputs_dict['imgs'].device
-            results_list = [
-                self._empty_3d_prediction(data_sample, device)
-                for data_sample in batch_data_samples
-            ]
-            reconstruction_points = None
+        vggt_token_list, ps_idx, img = self.extract_feat(
+            batch_inputs_dict, batch_data_samples, 'test')
+        reconstruction_outputs, view_predictions = (
+            self.semantic_encoder.predict_reconstruction(
+                batch_inputs_dict['imgs'], batch_data_samples,
+                self.feature_projector(vggt_token_list, img, ps_idx),
+                return_predictions=True))
+        reconstruction_points = reconstruction_outputs[1]
+        reconstruction_hidden = (
+            self.semantic_encoder.model._last_reconstruction_hidden_states)
+        query_xyz, query = self._cluster_reconstruction_queries(
+            reconstruction_hidden, reconstruction_outputs,
+            batch_inputs_dict['imgs'])[:2]
+        box_features, refined_query_xyz = self.get_box_features(
+            vggt_token_list, ps_idx, batch_inputs_dict, img,
+            batch_data_samples, query_xyz, query)
+        layer_ids = list(range(len(box_features)))
+        if self.test_only_last_layer:
+            box_features = [box_features[-1]]
+            refined_query_xyz = [refined_query_xyz[-1]]
+            layer_ids = [layer_ids[-1]]
+        results_list = self.bbox_head.predict(
+            box_features,
+            batch_data_samples,
+            batch_inputs_dict,
+            refined_query_xyz=refined_query_xyz,
+            layer_ids=layer_ids,
+            **kwargs)
         scene_2d_predictions = []
         scene_reconstruction_predictions = []
         scene_view_predictions = []
@@ -388,13 +299,10 @@ class ReconDet(Base3DDetector):
             view_predictions_for_scene = view_predictions[start:end]
             scene_view_predictions.append(view_predictions_for_scene)
             scene_2d_predictions.append(InstanceData.cat(view_predictions_for_scene))
-            if reconstruction_points is not None:
-                scene_reconstruction_predictions.append([
-                    InstanceData(points_3d=points)
-                    for points in reconstruction_points[start:end]
-                ])
-            else:
-                scene_reconstruction_predictions.append([])
+            scene_reconstruction_predictions.append([
+                InstanceData(points_3d=points)
+                for points in reconstruction_points[start:end]
+            ])
             batch_data_samples[batch_index].pred_instances_2d_views = \
                 view_predictions_for_scene
             batch_data_samples[batch_index].pred_reconstruction = \

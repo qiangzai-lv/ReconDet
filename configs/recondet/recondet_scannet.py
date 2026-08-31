@@ -80,12 +80,6 @@ model = dict(
     num_queries=256,
     token_dim=_token_dim_,
     test_only_last_layer=True,
-    enable_3d_detection_loss=True,
-    enable_3d_reconstruction=True,
-    enable_2d_loss=True,
-    loss_weight_2d_detection=0.5,
-    loss_weight_3d_point=2.0,
-    loss_weight_3d_bbox=1.0,
     if_mix_precision=True,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
@@ -119,7 +113,7 @@ train_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=5,
+        n_images=42,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -134,7 +128,7 @@ test_pipeline = [
     dict(type='LoadAnnotations3D'),
     dict(
         type='MultiViewPipeline',
-        n_images=1,
+        n_images=128,
         transforms=[
             dict(type='LoadImageFromFile', file_client_args=dict(backend='disk')),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -152,7 +146,7 @@ train_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type='RepeatDataset',
-        times=1,
+        times=6,
         dataset=dict(
             type=dataset_type,
             data_root=data_root,

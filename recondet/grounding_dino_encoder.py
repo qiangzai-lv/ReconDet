@@ -185,8 +185,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
         return normalized
 
     def loss(self, images, batch_data_samples, vggt_feature_maps=None,
-             return_reconstruction=False,
-             enable_3d_reconstruction_loss=True):
+             return_reconstruction=False):
         batch_size, num_views = images.shape[:2]
         padded_shape = images.shape[-2:]
 
@@ -204,8 +203,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
             normalized,
             samples,
             vggt_feature_maps=flattened_vggt_features,
-            return_reconstruction=return_reconstruction,
-            enable_3d_reconstruction_loss=enable_3d_reconstruction_loss)
+            return_reconstruction=return_reconstruction)
 
     @torch.no_grad()
     def predict_and_print(self, images, batch_data_samples) -> None:
