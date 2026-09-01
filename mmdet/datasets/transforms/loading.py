@@ -305,6 +305,17 @@ class LoadAnnotations(MMCV_LoadAnnotations):
         results['gt_bboxes_labels'] = np.array(
             gt_bboxes_labels, dtype=np.int64)
 
+    def _load_keypoints(self, results: dict) -> None:
+        """Load optional reconstruction keypoints from COCO instances."""
+        keypoints = [instance.get('keypoints_2d', [0.] * 8)
+                     for instance in results.get('instances', [])]
+        visibility = [instance.get('keypoints_visibility', [1., 1., 1., 1.])
+                      for instance in results.get('instances', [])]
+        results['gt_keypoints_2d'] = np.asarray(keypoints, dtype=np.float32).reshape(-1, 8)
+        results['gt_keypoints_2d_original'] = results['gt_keypoints_2d'].copy()
+        results['gt_keypoints_visibility'] = np.asarray(
+            visibility, dtype=np.float32).reshape(-1, 4)
+
     def _poly2mask(self, mask_ann: Union[list, dict], img_h: int,
                    img_w: int) -> np.ndarray:
         """Private function to convert masks represented with polygon to
@@ -447,6 +458,9 @@ class LoadAnnotations(MMCV_LoadAnnotations):
             self._load_masks(results)
         if self.with_seg:
             self._load_seg_map(results)
+        if any('keypoints_2d' in instance
+               for instance in results.get('instances', [])):
+            self._load_keypoints(results)
         return results
 
     def __repr__(self) -> str:
@@ -459,6 +473,32 @@ class LoadAnnotations(MMCV_LoadAnnotations):
         repr_str += f"imdecode_backend='{self.imdecode_backend}', "
         repr_str += f'backend_args={self.backend_args})'
         return repr_str
+
+
+@TRANSFORMS.register_module()
+class TransformKeypoints(BaseTransform):
+    """Apply resize/flip metadata to reconstruction keypoints."""
+
+    def transform(self, results: dict) -> dict:
+        if 'gt_keypoints_2d_original' not in results:
+            return results
+        points = results['gt_keypoints_2d_original'].reshape(-1, 4, 2).copy()
+        scale = np.asarray(results.get('scale_factor', [1., 1.]), dtype=np.float32)
+        if scale.size >= 2:
+            points[..., 0] *= scale[0]
+            points[..., 1] *= scale[1]
+        if results.get('flip', False):
+            h, w = results['img_shape'][:2]
+            direction = results.get('flip_direction', 'horizontal')
+            if direction == 'horizontal':
+                points[..., 0] = w - points[..., 0]
+            elif direction == 'vertical':
+                points[..., 1] = h - points[..., 1]
+            else:
+                points[..., 0] = w - points[..., 0]
+                points[..., 1] = h - points[..., 1]
+        results['gt_keypoints_2d'] = points.reshape(-1, 8)
+        return results
 
 
 @TRANSFORMS.register_module()
@@ -787,7 +827,9 @@ class FilterAnnotations(BaseTransform):
             if self.keep_empty:
                 return None
 
-        keys = ('gt_bboxes', 'gt_bboxes_labels', 'gt_masks', 'gt_ignore_flags')
+        keys = ('gt_bboxes', 'gt_bboxes_labels', 'gt_masks', 'gt_ignore_flags',
+                'gt_keypoints_2d', 'gt_keypoints_2d_original',
+                'gt_keypoints_visibility')
         for key in keys:
             if key in results:
                 results[key] = results[key][keep]

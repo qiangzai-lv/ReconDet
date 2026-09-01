@@ -128,7 +128,7 @@ class CocoDataset(BaseDetDataset):
         data_info['width'] = img_info['width']
 
         if self.return_classes:
-            data_info['text'] = self.metainfo['classes']
+            data_info['text'] = '. '.join(self.metainfo['classes']) + '.'
             data_info['caption_prompt'] = self.caption_prompt
             data_info['custom_entities'] = True
 
@@ -155,6 +155,10 @@ class CocoDataset(BaseDetDataset):
                 instance['ignore_flag'] = 0
             instance['bbox'] = bbox
             instance['bbox_label'] = self.cat2label[ann['category_id']]
+            if 'keypoints_2d' in ann:
+                instance['keypoints_2d'] = ann['keypoints_2d']
+                instance['keypoints_visibility'] = ann.get(
+                    'keypoints_visibility', [1, 1, 1, 1])
 
             if ann.get('segmentation', None):
                 instance['mask'] = ann['segmentation']
