@@ -173,8 +173,8 @@ metainfo = dict(classes=(
 backend_args = None
 
 train_dataloader = dict(
-    batch_size=2,
-    num_workers=2,
+    batch_size=24,
+    num_workers=12,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     batch_sampler=dict(type='AspectRatioBatchSampler'),
@@ -189,8 +189,8 @@ train_dataloader = dict(
         pipeline=train_pipeline,
         backend_args=backend_args))
 val_dataloader = dict(
-    batch_size=1,
-    num_workers=2,
+    batch_size=24,
+    num_workers=12,
     persistent_workers=True,
     drop_last=False,
     sampler=dict(type='DefaultSampler', shuffle=False),
@@ -210,6 +210,7 @@ val_evaluator = dict(
     type='CocoMetric',
     ann_file=scannet_ann_root + 'keypoints_bbox_val.json',
     metric='bbox',
+    classwise=True,
     format_only=False,
     backend_args=backend_args)
 test_evaluator = val_evaluator
@@ -227,30 +228,26 @@ optim_wrapper = dict(
             'language_model': dict(lr_mult=0.1),
         }))
 
-# learning policy
-max_epochs = 30
+# training schedule for 1x
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=12, val_interval=1)
+val_cfg = dict(type='ValLoop')
+test_cfg = dict(type='TestLoop')
+
+# learning rate
 param_scheduler = [
-    dict(type='LinearLR', start_factor=0.1, by_epoch=False, begin=0, end=1000),
+    dict(
+        type='LinearLR', start_factor=0.001, by_epoch=False, begin=0, end=500),
     dict(
         type='MultiStepLR',
         begin=0,
-        end=max_epochs,
+        end=12,
         by_epoch=True,
-        milestones=[19, 26],
+        milestones=[8, 11],
         gamma=0.1)
 ]
-
-train_cfg = dict(
-    type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
 
 # NOTE: `auto_scale_lr` is for automatically scaling LR,
 # USER SHOULD NOT CHANGE ITS VALUES.
 # base_batch_size = (16 GPUs) x (2 samples per GPU)
-auto_scale_lr = dict(base_batch_size=64)
 
-default_hooks = dict(visualization=dict(type='GroundingVisualizationHook'))
 find_unused_parameters = True
-model_wrapper_cfg = dict(
-    type='MMDistributedDataParallel',
-    find_unused_parameters=True,
-    static_graph=True)
