@@ -11,7 +11,7 @@ lang_model_name = '/root/shared-nvme/data/pretrain/bert-base-uncased'
 
 model = dict(
     type='GroundingDINO',
-    freeze_modules=['language_model', 'backbone', 'neck', 'encoder'],
+    freeze_modules=['language_model', 'backbone', 'neck'],
     num_queries=64,
     with_box_refine=True,
     as_two_stage=True,
@@ -251,3 +251,7 @@ param_scheduler = [
 # base_batch_size = (16 GPUs) x (2 samples per GPU)
 
 find_unused_parameters = True
+model_wrapper_cfg = dict(
+    type='MMDistributedDataParallel',
+    find_unused_parameters=True,
+    static_graph=True)
