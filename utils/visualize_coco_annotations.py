@@ -38,6 +38,14 @@ def visualize(args):
     annotations = defaultdict(list)
     for annotation in coco.get('annotations', []):
         annotations[int(annotation['image_id'])].append(annotation)
+    bbox_annotations = defaultdict(list)
+    if args.bbox_json:
+        with Path(args.bbox_json).open() as handle:
+            bbox_data = json.load(handle)
+        for annotation in bbox_data.get('annotations', []):
+            bbox_annotations[int(annotation['image_id'])].append(annotation)
+        LOGGER.info('Loaded %d bbox annotations from %s',
+                    len(bbox_data.get('annotations', [])), args.bbox_json)
     images = list(coco.get('images', []))
     if args.shuffle:
         random.Random(args.seed).shuffle(images)
@@ -71,9 +79,23 @@ def visualize(args):
             continue
 
         draw = ImageDraw.Draw(image)
+        # Draw derived boxes first, so keypoints remain visible on top.
+        for annotation in bbox_annotations.get(int(image_record['id']), []):
+            if 'bbox' not in annotation:
+                continue
+            x, y, box_width, box_height = annotation['bbox']
+            category_id = int(annotation['category_id'])
+            draw.rectangle((x, y, x + box_width, y + box_height),
+                           outline=_color(category_id),
+                           width=max(1, args.line_width))
         for annotation in annotations.get(int(image_record['id']), []):
             category_id = int(annotation['category_id'])
             color = _color(category_id)
+            if 'bbox' in annotation:
+                x, y, box_width, box_height = annotation['bbox']
+                draw.rectangle((x, y, x + box_width, y + box_height),
+                               outline=color,
+                               width=max(1, args.line_width))
             keypoints = annotation.get('keypoints_2d')
             if keypoints is not None and len(keypoints) >= 8:
                 points = [(float(keypoints[i]), float(keypoints[i + 1]))
@@ -135,6 +157,8 @@ def visualize(args):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--coco-json', required=True)
+    parser.add_argument('--bbox-json', default=None,
+                        help='Optional COCO bbox JSON to overlay on the same images')
     parser.add_argument('--output-dir', required=True)
     parser.add_argument('--image-root', default=None,
                         help='Root for relative COCO file_name values')
