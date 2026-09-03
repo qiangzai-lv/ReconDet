@@ -41,7 +41,10 @@ class DINO(DeformableDETR):
             dn_cfg['num_classes'] = self.bbox_head.num_classes
             dn_cfg['embed_dims'] = self.embed_dims
             dn_cfg['num_matching_queries'] = self.num_queries
-        self.dn_query_generator = CdnQueryGenerator(**dn_cfg)
+        # ``None`` explicitly disables denoising queries. Keep the attribute
+        # for downstream decoder code, which checks for its presence.
+        self.dn_query_generator = (
+            None if dn_cfg is None else CdnQueryGenerator(**dn_cfg))
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
