@@ -318,9 +318,13 @@ class ReconGroundingDINO(DINO):
     ) -> Dict:
         encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
             img_feats, batch_data_samples)
+        self._last_valid_ratios = decoder_inputs_dict['valid_ratios']
 
         encoder_outputs_dict = self.forward_encoder(
             **encoder_inputs_dict, text_dict=text_dict)
+        self._last_semantic_feature_maps = recover_feature_maps(
+            encoder_outputs_dict['memory'],
+            encoder_outputs_dict['spatial_shapes'])
 
         tmp_dec_in, head_inputs_dict = self.pre_decoder(
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
@@ -357,8 +361,12 @@ class ReconGroundingDINO(DINO):
         semantic_feature_maps = recover_feature_maps(memory, spatial_shapes)
         semantic_features = flatten_feature_maps(semantic_feature_maps)
         spatial_features = flatten_feature_maps(vggt_feature_maps)
+        # With DN queries disabled, the final ``num_queries`` 2D queries map
+        # directly to the reconstruction queries. Keep the slice explicit so
+        # this remains correct if DN queries are enabled for another model.
+        semantic_query = query[:, -self.num_queries:, :]
         spatial_query = self.reconstruction_decoder.initialize_query(
-            query.shape[0])
+            query.shape[0], semantic_query=semantic_query)
         intermediate = []
         intermediate_reference_points = [reference_points]
         reconstruction_intermediate = []
@@ -416,7 +424,8 @@ class ReconGroundingDINO(DINO):
             inter_states = query
             references = reference_points
 
-        if len(query) == self.num_queries:
+        if (len(query) == self.num_queries and
+                self.dn_query_generator is not None):
             inter_states[0] += \
                 self.dn_query_generator.label_embedding.weight[0, 0] * 0.0
 
@@ -499,7 +508,7 @@ class ReconGroundingDINO(DINO):
 
         query = self.query_embedding.weight[:, None, :]
         query = query.repeat(1, bs, 1).transpose(0, 1)
-        if self.training:
+        if self.training and self.dn_query_generator is not None:
             dn_label_query, dn_bbox_query, dn_mask, dn_meta = \
                 self.dn_query_generator(batch_data_samples)
             query = torch.cat([dn_label_query, query], dim=1)
@@ -532,8 +541,7 @@ class ReconGroundingDINO(DINO):
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList, vggt_feature_maps=None,
-             return_reconstruction=False,
-             loss_view_indices=None) -> Union[dict, list]:
+             return_reconstruction=False) -> Union[dict, list]:
         text_prompts = [
             data_samples.text for data_samples in batch_data_samples
         ]
@@ -620,8 +628,7 @@ class ReconGroundingDINO(DINO):
         losses = self.bbox_head.loss(
             **head_inputs_dict,
             reconstruction_hidden_states=reconstruction_hidden_states,
-            batch_data_samples=batch_data_samples,
-            loss_view_indices=loss_view_indices)
+            batch_data_samples=batch_data_samples)
         if return_reconstruction:
             reconstruction_outputs = self.bbox_head.predict_reconstruction(
                 reconstruction_hidden_states,

@@ -99,6 +99,11 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                     boxes = instances.bboxes_3d
                     instances.centers_3d = boxes.gravity_center
                     metadata = data_sample.metainfo
+                    # Online labels use the same axis-aligned ScanNet point cloud
+                    # sampling as utils/scannet_3d_to_coco_keypoints_bbox.py.
+                    points = self.bbox_keypoint_projector.load_points(
+                        metadata.get('lidar_path'),
+                        metadata.get('axis_align_matrix', np.eye(4)))
                     keypoints = self.bbox_keypoint_projector(
                         centers=boxes.gravity_center,
                         dimensions=boxes.dims,
@@ -106,7 +111,8 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                         intrinsic=metadata['lidar2img']['intrinsic'],
                         scale_factor=metadata['scale_factor'],
                         image_shape=batch_input_shape,
-                        valid_image_shape=metadata['img_shape'])
+                        valid_image_shape=metadata['img_shape'],
+                        points=points)
                     instances.keypoints_3d = keypoints[0]
                     instances.keypoints_2d = keypoints[1]
                     instances.keypoints_visible = keypoints[2]

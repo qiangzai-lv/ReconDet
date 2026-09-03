@@ -13,7 +13,7 @@ resume = False
 data_root = '/root/shared-nvme/data/ScanNet_processed'
 vggt_omega_checkpoint = '/root/shared-nvme/data/vggt-omega/vggt_omega_1b_512.pt'
 grounding_dino_config = 'configs/gdino/grounding_dino_swin-t_pretrain_obj365.py'
-grounding_dino_checkpoint = '/root/shared-nvme/data/pretrain/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'
+grounding_dino_checkpoint = '/root/shared-nvme/code/Recondet_v7/work_dirs/grounding_dino_swin-t_fine_tune_scannet/epoch_4.pth'
 grounding_dino_classes = [
     'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
     'picture', 'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain',
@@ -81,9 +81,10 @@ model = dict(
     token_dim=_token_dim_,
     test_only_last_layer=True,
     enable_detection_loss=True,
-    enable_2d_loss=True,
-    num_2d_loss_views=5,
+    reconstruction_query_score_thr=0.1,
     if_mix_precision=True,
+    debug_projection_vis=False,
+    debug_projection_vis_interval=10,
     train_cfg=dict(),
     test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
 )

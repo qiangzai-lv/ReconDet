@@ -4,7 +4,8 @@ from .grounding_dino_decoder import ReconGroundingDINO
 from .grounding_dino_3d_decoder import GroundingDINO3DDecoder
 from .grounding_dino_3d_head import GroundingDINO3DHead
 from .grounding_dino_encoder import GroundingDINOSemanticEncoder
-from .grounding_dino_head import ReconGroundingDINOHead
+from .grounding_dino_head import (ReconGroundingDINOHead,
+                                   ReconGroundingDINOKeypointHead)
 from .multiview_pipeline import LoadFirstFramePose, MultiViewPipeline
 from .scannet_multiview_dataset import MultiViewScanNetDataset
 from .recondet import ReconDet
@@ -16,6 +17,7 @@ __all__ = [
     'LoadFirstFramePose', 'MultiViewPipeline', 'PackNeRFDetInputs',
     'VGGTDetDataPreprocessor', 'ReconGroundingDINO',
     'GroundingDINOSemanticEncoder', 'GroundingDINO3DDecoder',
-    'GroundingDINO3DHead', 'ReconGroundingDINOHead', 'ReconDetHead',
+    'GroundingDINO3DHead', 'ReconGroundingDINOHead',
+    'ReconGroundingDINOKeypointHead', 'ReconDetHead',
     'WeightedFPSKMeans'
 ]

@@ -1,6 +1,9 @@
 from typing import List, Tuple, Union
+import os
 
 import torch
+import numpy as np
+from PIL import Image, ImageDraw
 from mmengine.structures import InstanceData
 from recondet.feature_projection import VGGTFeatureProjector
 
@@ -14,6 +17,9 @@ from recondet.device import autocast, get_device
 from recondet.geometry_attention import GeometryAwareDeformableDecoder
 from recondet.grounding_dino_encoder import GroundingDINOSemanticEncoder
 from recondet.scene_query_clustering import WeightedFPSKMeans
+from recondet.query_correspondence import (
+    aggregate_cluster_view_references, assign_points_to_clusters,
+    select_candidate_indices)
 from vggt_omega.models import VGGTOmega
 
 device = get_device()
@@ -42,8 +48,10 @@ class ReconDet(Base3DDetector):
             semantic_classes=(),
             grounding_dino_print_score_thr=0.3,
             deformable_num_points=4,
-            num_2d_loss_views=None,
-            enable_2d_loss=True
+            reconstruction_query_score_thr=0.1,
+            debug_projection_vis=False,
+            debug_projection_vis_interval=10,
+            debug_projection_vis_dir=None
     ):
 
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)
@@ -56,8 +64,7 @@ class ReconDet(Base3DDetector):
             config=grounding_dino_config,
             checkpoint=grounding_dino_checkpoint,
             classes=semantic_classes,
-            print_score_thr=grounding_dino_print_score_thr,
-            num_2d_loss_views=num_2d_loss_views)
+            print_score_thr=grounding_dino_print_score_thr)
 
         self.vggt_encoder = VGGTOmega()
         self.vggt_encoder.load_state_dict(
@@ -110,7 +117,68 @@ class ReconDet(Base3DDetector):
         self.if_mix_precision = if_mix_precision
         self.if_save_vggt_feature = if_save_vggt_feature
         self.enable_detection_loss = enable_detection_loss
-        self.enable_2d_loss = enable_2d_loss
+        self.reconstruction_query_score_thr = reconstruction_query_score_thr
+        # Temporary online-label debugging; remove after projection validation.
+        self._projection_debug_iter = 0
+        self._projection_debug_enabled = debug_projection_vis
+        self._projection_debug_interval = debug_projection_vis_interval
+        self._projection_debug_dir = debug_projection_vis_dir or os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', 'projection_debug'))
+
+    @torch.no_grad()
+    def _visualize_projection_labels(self, images, data_samples):
+        if torch.distributed.is_available() and torch.distributed.is_initialized() \
+                and torch.distributed.get_rank() != 0:
+            return
+        if not data_samples or not hasattr(data_samples[0], 'gt_instances_3d'):
+            return
+        instances = data_samples[0].gt_instances_3d
+        if not all(hasattr(instances, key) for key in
+                   ('bboxes_2d', 'bboxes_2d_visible', 'keypoints_2d',
+                    'keypoints_visible')):
+            return
+        os.makedirs(self._projection_debug_dir, exist_ok=True)
+        imgs = images[0].detach().float().cpu()
+        # Visualization is called before extract_feat: inputs are commonly
+        # uint8-like 0..255 tensors, but may already be normalized by the
+        # data preprocessor. Restore display-space RGB values in both cases.
+        if imgs.numel() and imgs.max() > 1.5:
+            imgs = imgs / 255.0
+        elif imgs.numel() and imgs.min() < 0:
+            preprocessor = getattr(self, 'data_preprocessor', None)
+            mean = getattr(preprocessor, 'mean', None)
+            std = getattr(preprocessor, 'std', None)
+            if mean is not None and std is not None:
+                mean = torch.as_tensor(mean).cpu().view(1, -1, 1, 1)
+                std = torch.as_tensor(std).cpu().view(1, -1, 1, 1)
+                imgs = (imgs * std + mean) / 255.0
+        imgs = imgs.clamp(0, 1)
+        bboxes = instances.bboxes_2d.detach().cpu()
+        bbox_valid = instances.bboxes_2d_visible.detach().cpu().bool()
+        keypoints = instances.keypoints_2d.detach().cpu()
+        keypoint_valid = instances.keypoints_visible.detach().cpu().bool()
+        max_views = min(int(imgs.shape[0]), 10)
+        colors = ('red', 'lime', 'cyan', 'yellow')
+        for view in range(max_views):
+            array = (imgs[view].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            image = Image.fromarray(array)
+            draw = ImageDraw.Draw(image)
+            height, width = array.shape[:2]
+            for obj in range(len(bboxes)):
+                if bbox_valid[obj, view]:
+                    x1, y1, x2, y2 = (bboxes[obj, view] *
+                                      torch.tensor([width, height, width, height])).tolist()
+                    draw.rectangle((x1, y1, x2, y2), outline='red', width=2)
+                points = keypoints[obj, view] * torch.tensor([width, height])
+                for point, valid, color in zip(points, keypoint_valid[obj, view], colors):
+                    if not valid:
+                        continue
+                    x, y = point.tolist(); radius = 3
+                    draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=color)
+            path = os.path.join(
+                self._projection_debug_dir,
+                f'iter_{self._projection_debug_iter:06d}_view_{view:02d}.jpg')
+            image.save(path, quality=90)
 
     @torch.no_grad()
     def extract_feat(self, batch_inputs_dict: dict,
@@ -131,104 +199,91 @@ class ReconDet(Base3DDetector):
                     img)
                 return aggregated_tokens_list, ps_idx, img
 
-    def _get_projection_cameras(self, batch_data_samples, images):
-        extrinsics = []
-        intrinsics = []
-        image_height, image_width = images.shape[-2:]
-        num_views = images.shape[1]
-        for data_sample in batch_data_samples:
-            metadata = data_sample.metainfo
-            camera_info = metadata['lidar2img']
-            sample_extrinsics = torch.as_tensor(
-                camera_info['extrinsic'], device=images.device,
-                dtype=torch.float32)
-            sample_intrinsic = torch.as_tensor(
-                camera_info['intrinsic'], device=images.device,
-                dtype=torch.float32)[:3, :3].clone()
-            ori_height, ori_width = metadata['ori_shape'][:2]
-            image_scale = min(
-                image_height / ori_height, image_width / ori_width)
-            sample_intrinsic[:2] *= image_scale
-
-            extrinsics.append(sample_extrinsics[:, :3])
-            intrinsics.append(sample_intrinsic.expand(num_views, -1, -1))
-        return torch.stack(extrinsics), torch.stack(intrinsics)
-
-    @staticmethod
-    def _format_gdino_losses(losses):
-        aggregated = {}
-        passthrough = {}
-        for name, value in losses.items():
-            if name.startswith('d') and '.' in name:
-                layer_name, loss_name = name.split('.', 1)
-                if layer_name[1:].isdigit():
-                    aggregated.setdefault(loss_name, []).append(value)
-                    continue
-            passthrough[name] = value
-
-        formatted = dict(passthrough)
-        for name, values in aggregated.items():
-            formatted[name] = torch.stack(values).sum()
-        return formatted
-
-    @staticmethod
-    def _remove_2d_losses(losses):
-        """Remove Grounding DINO 2D box and keypoint supervision losses."""
-        removed_names = {
-            'loss_cls', 'loss_bbox', 'loss_iou',
-            'loss_keypoint_center', 'loss_keypoint_faces',
-        }
-        return {
-            name: value for name, value in losses.items()
-            if (name.split('.', 1)[-1] not in removed_names and
-                not name.startswith(('dn_loss_', 'enc_loss_')))
-        }
-
     def _cluster_reconstruction_queries(self, reconstruction_hidden,
                                         reconstruction_outputs, images):
         reconstruction_cls, reconstruction_points = reconstruction_outputs
         batch_size, num_views = images.shape[:2]
-        reconstruction_hidden = reconstruction_hidden[-1].reshape(
-            batch_size, num_views * reconstruction_hidden.shape[2],
-            reconstruction_hidden.shape[3])
-        reconstruction_points = reconstruction_points.reshape(
-            batch_size, num_views * reconstruction_points.shape[1], 3)
-        reconstruction_cls = reconstruction_cls.reshape(
-            batch_size, num_views * reconstruction_cls.shape[1],
-            reconstruction_cls.shape[2])
-        cluster_xyz, cluster_query, cluster_scores = (
-            self.scene_query_clustering(
-                reconstruction_points, reconstruction_hidden,
-                reconstruction_cls))
-        return cluster_xyz.detach(), cluster_query.detach(), cluster_scores.detach()
+        query_count = reconstruction_points.shape[1]
+        hidden = reconstruction_hidden[-1].reshape(
+            batch_size, num_views, query_count, -1)
+        points = reconstruction_points.reshape(
+            batch_size, num_views, query_count, 3)
+        classes = reconstruction_cls.reshape(
+            batch_size, num_views, query_count, -1)
+        head = self.semantic_encoder.model.bbox_head
+        selection_scores = (
+            head._last_cls_scores[-1].sigmoid().amax(-1).reshape(
+                batch_size, num_views, query_count))
+        reconstruction_scores = classes.sigmoid().amax(-1)
+        bbox_centers = head._last_bbox_preds[-1, ..., :2].reshape(
+            batch_size, num_views, query_count, 2)
+        view_ids = torch.arange(num_views, device=points.device)[:, None]
+        view_ids = view_ids.expand(num_views, query_count).reshape(-1)
+
+        clustered = []
+        for batch_id in range(batch_size):
+            flat_selection_scores = selection_scores[batch_id].reshape(-1)
+            ids = select_candidate_indices(
+                flat_selection_scores, self.reconstruction_query_score_thr,
+                self.num_queries)
+            selected_points = points[batch_id].reshape(-1, 3)[ids]
+            selected_hidden = hidden[batch_id].reshape(
+                -1, hidden.shape[-1])[ids]
+            selected_classes = classes[batch_id].reshape(
+                -1, classes.shape[-1])[ids]
+            cluster_xyz, cluster_query, cluster_scores = (
+                self.scene_query_clustering(
+                    selected_points[None], selected_hidden[None],
+                    selected_classes[None]))
+            selected_assignment = assign_points_to_clusters(
+                selected_points[None], cluster_xyz)
+            references, mask = aggregate_cluster_view_references(
+                selected_points[None],
+                bbox_centers[batch_id].reshape(-1, 2)[ids][None],
+                reconstruction_scores[batch_id].reshape(-1)[ids][None],
+                view_ids[ids][None], cluster_xyz,
+                num_views, assignments=selected_assignment)
+            candidate_clusters = torch.full(
+                (num_views * query_count,), -1, dtype=torch.long,
+                device=points.device)
+            candidate_clusters[ids] = selected_assignment[0]
+            candidate_clusters = candidate_clusters.reshape(
+                num_views, query_count)
+            clustered.append((cluster_xyz[0], cluster_query[0],
+                              cluster_scores[0], references[0], mask[0],
+                              candidate_clusters))
+        outputs = [torch.stack(items) for items in zip(*clustered)]
+        return tuple(output.detach() for output in outputs)
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
-                         images, batch_data_samples, query_xyz, query):
+                         images, batch_data_samples, query_xyz, query,
+                         reference_points_2d, reference_view_mask):
         feature_maps = self.feature_projector(
             vggt_token_list,
             images,
             ps_idx)
-        camera_extrinsics, camera_intrinsics = self._get_projection_cameras(
-            batch_data_samples, images)
-        batch_inputs_dict['camera_extrinsics'] = camera_extrinsics
-        batch_inputs_dict['camera_intrinsics'] = camera_intrinsics
-
         query_xyz = query_xyz.to(device=images.device, dtype=images.dtype)
         query = query.to(device=images.device, dtype=feature_maps[0].dtype)
         batch_inputs_dict['query_xyz'] = query_xyz
         return self.decoder(
             query,
             feature_maps,
+            self.semantic_encoder.last_semantic_feature_maps,
             query_xyz,
-            camera_extrinsics,
-            camera_intrinsics,
-            images.shape[-2:],
+            reference_points_2d,
+            reference_view_mask,
+            self.semantic_encoder.last_valid_ratios,
             self.pos_embedding,
             self.query_projection,
             self.bbox_head.center_heads)
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
+        self._projection_debug_iter += 1
+        if (self.training and self._projection_debug_enabled and
+                self._projection_debug_interval > 0 and
+                self._projection_debug_iter % self._projection_debug_interval == 0):
+            self._visualize_projection_labels(batch_inputs_dict['imgs'], batch_data_samples)
         vggt_token_list, ps_idx, img = self.extract_feat(
             batch_inputs_dict, batch_data_samples, 'train')
         vggt_feature_maps = self.feature_projector(
@@ -239,18 +294,17 @@ class ReconDet(Base3DDetector):
                 batch_data_samples,
                 vggt_feature_maps=vggt_feature_maps,
                 return_reconstruction=True))
-        semantic_losses = self._format_gdino_losses(semantic_losses)
-        if not self.enable_2d_loss:
-            semantic_losses = self._remove_2d_losses(semantic_losses)
         losses = {f'gdino_{name}': value
                   for name, value in semantic_losses.items()}
         if self.enable_detection_loss:
-            query_xyz, query = self._cluster_reconstruction_queries(
-                reconstruction_hidden, reconstruction_outputs,
-                batch_inputs_dict['imgs'])[:2]
+            query_xyz, query, _, references_2d, view_mask, _ = (
+                self._cluster_reconstruction_queries(
+                    reconstruction_hidden, reconstruction_outputs,
+                    batch_inputs_dict['imgs']))
             box_features, refined_query_xyz = self.get_box_features(
                 vggt_token_list, ps_idx, batch_inputs_dict, img,
-                batch_data_samples, query_xyz, query)
+                batch_data_samples, query_xyz, query, references_2d,
+                view_mask)
             detection_losses = self.bbox_head.loss(
                 box_features,
                 batch_data_samples,
@@ -272,12 +326,13 @@ class ReconDet(Base3DDetector):
                 self.feature_projector(vggt_token_list, img, ps_idx)))
         reconstruction_hidden = (
             self.semantic_encoder.model._last_reconstruction_hidden_states)
-        query_xyz, query = self._cluster_reconstruction_queries(
-            reconstruction_hidden, reconstruction_outputs,
-            batch_inputs_dict['imgs'])[:2]
+        query_xyz, query, _, references_2d, view_mask, candidate_clusters = (
+            self._cluster_reconstruction_queries(
+                reconstruction_hidden, reconstruction_outputs,
+                batch_inputs_dict['imgs']))
         box_features, refined_query_xyz = self.get_box_features(
             vggt_token_list, ps_idx, batch_inputs_dict, img,
-            batch_data_samples, query_xyz, query)
+            batch_data_samples, query_xyz, query, references_2d, view_mask)
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
@@ -312,15 +367,21 @@ class ReconDet(Base3DDetector):
             end = start + num_views
             view_predictions_for_scene = view_predictions[start:end]
             normalized_view_predictions = []
-            for prediction in view_predictions_for_scene:
+            for view_index, prediction in enumerate(view_predictions_for_scene):
                 if hasattr(prediction, 'pred_instances'):
                     prediction = prediction.pred_instances
+                query_indices = prediction.query_indices
+                cluster_indices = torch.full_like(query_indices, -1)
+                valid = ((query_indices >= 0) &
+                         (query_indices < candidate_clusters.shape[-1]))
+                cluster_indices[valid] = candidate_clusters[
+                    batch_index, view_index, query_indices[valid]]
                 normalized_view_predictions.append(
                     InstanceData(
                         bboxes=prediction.bboxes,
                         scores=prediction.scores,
                         labels=prediction.labels,
-                        query_indices=prediction.query_indices))
+                        query_indices=cluster_indices))
             scene_view_predictions.append(normalized_view_predictions)
             scene_2d_predictions.append(
                 InstanceData.cat(normalized_view_predictions))
@@ -353,12 +414,13 @@ class ReconDet(Base3DDetector):
                 vggt_feature_maps=self.feature_projector(
                     vggt_token_list, img, ps_idx),
                 return_reconstruction=True))
-        query_xyz, query = self._cluster_reconstruction_queries(
-            reconstruction_hidden, reconstruction_outputs,
-            batch_inputs_dict['imgs'])[:2]
+        query_xyz, query, _, references_2d, view_mask, _ = (
+            self._cluster_reconstruction_queries(
+                reconstruction_hidden, reconstruction_outputs,
+                batch_inputs_dict['imgs']))
         box_features, refined_query_xyz = self.get_box_features(
             vggt_token_list, ps_idx, batch_inputs_dict, img,
-            batch_data_samples, query_xyz, query)
+            batch_data_samples, query_xyz, query, references_2d, view_mask)
 
         layer_ids = list(range(len(box_features)))
         if self.test_only_last_layer:

@@ -156,6 +156,11 @@ class GroundingDINO3DDecoder(nn.Module):
                  num_points=4, dropout=0.0):
         super().__init__()
         self.num_queries = num_queries
+        # Direct semantic interaction with the scene reconstruction queries.
+        # The zero gate preserves the behavior of checkpoints trained before
+        # this connection was introduced.
+        self.semantic_query_projection = nn.Linear(semantic_dims, query_dims)
+        self.semantic_query_gate = nn.Parameter(torch.zeros(1))
         self.query_embedding = nn.Embedding(num_queries, query_dims)
         self.final_reference_embedding = FourierPositionEmbedding2D(
             query_dims, num_bands=8)
@@ -183,8 +188,12 @@ class GroundingDINO3DDecoder(nn.Module):
             layer.semantic_attention.attention.init_weights()
             layer.spatial_attention.attention.init_weights()
 
-    def initialize_query(self, batch_size):
-        return self.query_embedding.weight[None].expand(batch_size, -1, -1)
+    def initialize_query(self, batch_size, semantic_query=None):
+        query = self.query_embedding.weight[None].expand(batch_size, -1, -1)
+        if semantic_query is not None:
+            semantic_query = self.semantic_query_projection(semantic_query)
+            query = query + self.semantic_query_gate * semantic_query
+        return query
 
     def add_final_reference_embedding(self, query, reference_points):
         return self.final_reference_embedding(query, reference_points)

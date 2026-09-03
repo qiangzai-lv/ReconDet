@@ -108,10 +108,10 @@ model = dict(
     positional_encoding=dict(
         num_feats=128, normalize=True, offset=0.0, temperature=20),
     bbox_head=dict(
-        type='ReconGroundingDINOHead',
+        type='ReconGroundingDINOKeypointHead',
         reconstruction_dims=512,
-        point_3d_loss_weight=6.0,
-        class_3d_loss_weight=6.0,
+        point_3d_loss_weight=32.0,
+        class_3d_loss_weight=2.0,
         point_range=(-6.5, -9.0, -1.0, 6.5, 9.0, 4.5),
         num_classes=256,
         sync_cls_avg_factor=True,
@@ -122,12 +122,12 @@ model = dict(
             gamma=2.0,
             alpha=0.25,
             loss_weight=1.0),  # 2.0 in DeformDETR
-        loss_bbox=dict(type='mmdet.L1Loss', loss_weight=5.0)),
-    dn_cfg=dict(  # TODO: Move to model.train_cfg ?
-        label_noise_scale=0.5,
-        box_noise_scale=1.0,  # 0.4 for DN-DETR
-        group_cfg=dict(dynamic=True, num_groups=None,
-                       num_dn_queries=100)),  # TODO: half num_dn_queries
+        loss_bbox=dict(type='mmdet.L1Loss', loss_weight=5.0),
+        keypoint_center_loss_weight=1.0,
+        keypoint_face_loss_weight=1.0,
+        keypoint_inside_loss_weight=0.25),
+    # Recondet uses only regular scene queries.
+    dn_cfg=None,
     # training and testing settings
     train_cfg=dict(
         assigner=dict(

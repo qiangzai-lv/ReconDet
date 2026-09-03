@@ -21,14 +21,10 @@ class GroundingDINOSemanticEncoder(nn.Module):
                  config: str,
                  checkpoint: str,
                  classes: Sequence[str],
-                 print_score_thr: float = 0.3,
-                 num_2d_loss_views: int = None) -> None:
+                 print_score_thr: float = 0.3) -> None:
         super().__init__()
         if not classes:
             raise ValueError('GroundingDINO classes must not be empty.')
-        if num_2d_loss_views is not None and num_2d_loss_views < 1:
-            raise ValueError('num_2d_loss_views must be positive or None.')
-        self.num_2d_loss_views = num_2d_loss_views
         config_path = Path(config).expanduser()
         if not config_path.is_absolute():
             config_path = Path.cwd() / config_path
@@ -204,20 +200,22 @@ class GroundingDINOSemanticEncoder(nn.Module):
                     batch_size * num_views, *feature.shape[2:]).contiguous()
                 for feature in vggt_feature_maps
             ]
-        loss_view_indices = None
-        if self.num_2d_loss_views is not None:
-            views_per_scene = min(num_views, self.num_2d_loss_views)
-            loss_view_indices = []
-            for batch_index in range(batch_size):
-                sampled_views = torch.randperm(num_views)[:views_per_scene]
-                loss_view_indices.extend(
-                    (sampled_views + batch_index * num_views).tolist())
-        return self.model.loss(
+        result = self.model.loss(
             normalized,
             samples,
             vggt_feature_maps=flattened_vggt_features,
-            return_reconstruction=return_reconstruction,
-            loss_view_indices=loss_view_indices)
+            return_reconstruction=return_reconstruction)
+        self._reshape_semantic_feature_maps(batch_size, num_views)
+        return result
+
+    def _reshape_semantic_feature_maps(self, batch_size, num_views):
+        flat_maps = self.model._last_semantic_feature_maps
+        self.last_semantic_feature_maps = [
+            feature.reshape(batch_size, num_views, *feature.shape[1:])
+            for feature in flat_maps
+        ]
+        self.last_valid_ratios = self.model._last_valid_ratios.reshape(
+            batch_size, num_views, *self.model._last_valid_ratios.shape[1:])
 
     @torch.no_grad()
     def predict_and_print(self, images, batch_data_samples) -> None:
@@ -283,6 +281,7 @@ class GroundingDINOSemanticEncoder(nn.Module):
         view_predictions = self.model.predict(
             flattened, samples, rescale=False,
             vggt_feature_maps=flattened_vggt_features)
+        self._reshape_semantic_feature_maps(batch_size, num_views)
         reconstruction_outputs = self.model._last_reconstruction_outputs
         if was_training:
             self.model.train()
